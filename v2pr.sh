@@ -20,8 +20,6 @@ IPV4=""
 IPV6=""
 IP=""
 PORT=""
-BACKEND_HOST=""
-BACKEND_HOST_NGINX=""
 BACKEND_PORT=""
 DOMAIN=""
 MODE=""
@@ -370,69 +368,6 @@ is_valid_proxy_url() {
     [[ "$1" =~ $re ]]
 }
 
-is_valid_backend_host() {
-    [[ "$1" =~ ^[A-Za-z0-9._:-]+$ ]]
-}
-
-has_ipv4_loopback() {
-    if command_exists ip; then
-        ip -4 addr show dev lo 2>/dev/null | grep -q '127\.0\.0\.1/' && return 0
-    fi
-
-    if command_exists ifconfig; then
-        ifconfig lo 2>/dev/null | grep -q '127\.0\.0\.1' && return 0
-    fi
-
-    if command_exists ping; then
-        ping -4 -c 1 -W 1 127.0.0.1 >/dev/null 2>&1 && return 0
-    fi
-
-    return 1
-}
-
-suggested_backend_host() {
-    if has_ipv4_loopback; then
-        echo "127.0.0.1"
-        return 0
-    fi
-
-    if [[ -n "$IPV4" ]]; then
-        echo "$IPV4"
-        return 0
-    fi
-
-    if [[ -n "$IPV6" ]]; then
-        echo "$IPV6"
-        return 0
-    fi
-
-    echo "127.0.0.1"
-}
-
-normalize_backend_host() {
-    BACKEND_HOST_NGINX="$BACKEND_HOST"
-
-    case "$BACKEND_HOST" in
-        ::1)
-            BACKEND_HOST_NGINX="[::1]"
-            ;;
-        *:*)
-            if [[ "$BACKEND_HOST" != \[*\] ]]; then
-                BACKEND_HOST_NGINX="[$BACKEND_HOST]"
-            fi
-            ;;
-    esac
-}
-
-backend_is_local() {
-    case "$BACKEND_HOST" in
-        127.0.0.1|localhost|::1|[::1])
-            return 0
-            ;;
-    esac
-    return 1
-}
-
 is_port_in_use() {
     local port="$1"
 
@@ -457,20 +392,16 @@ suggested_grpc_service() {
     echo "$(random_token 4 8).$(random_token 6 12)"
 }
 
-check_backend_target() {
-    if backend_is_local && [[ "$PORT" == "$BACKEND_PORT" ]]; then
-        die "当后端与 Nginx 在同一台机器上时，前端监听端口与后端回源端口不能相同"
+check_backend_port() {
+    if [[ "$PORT" == "$BACKEND_PORT" ]]; then
+        die "前端监听端口与后端监听端口不能相同"
     fi
 
-    if backend_is_local; then
-        if is_port_in_use "$BACKEND_PORT"; then
-            info "检测到本机后端端口 ${BACKEND_PORT} 正在监听"
-        else
-            warn "当前未检测到本机后端端口 ${BACKEND_PORT} 正在监听"
-            warn "脚本仍会继续写入 Nginx 配置；如果后续回源失败，请先确认后端已经启动并监听该端口"
-        fi
+    if is_port_in_use "$BACKEND_PORT"; then
+        info "检测到本机后端端口 ${BACKEND_PORT} 正在监听"
     else
-        info "后端回源目标：${BACKEND_HOST}:${BACKEND_PORT}"
+        warn "当前未检测到本机后端端口 ${BACKEND_PORT} 正在监听"
+        warn "脚本仍会继续写入 Nginx 配置；如果后续回源失败，请先确认后端已经启动并监听该端口"
     fi
 }
 
@@ -586,14 +517,12 @@ collect_transport_data() {
 }
 
 getData() {
-    local default_backend_host=""
-
     echo ""
     echo " 运行之前请确认如下条件已经具备："
     colorEcho "$YELLOW" "  1. 一个伪装域名 DNS 解析指向当前服务器 IP（${IP:-未检测到公网IP}）"
     colorEcho "$BLUE"   "  2. 证书将使用 Cloudflare DNS 模式申请，请提前准备可编辑 DNS 的 API Token"
-    colorEcho "$BLUE"   "  3. 你的后端已准备好使用 WS 或 gRPC，并监听在你将要填写的回源地址和端口上"
-    colorEcho "$BLUE"   "  4. 如果后端和 Nginx 在同机，建议后端只监听 127.0.0.1 / ::1，不要直接暴露到公网"
+    colorEcho "$BLUE"   "  3. 你的后端已准备好使用 WS 或 gRPC，并监听在你将要填写的后端端口上"
+    colorEcho "$BLUE"   "  4. 监听地址由后端自己处理，本脚本只负责 Nginx 反代和 TLS"
     echo ""
     read -r -p " 确认满足按 y，按其他退出脚本：" answer
     [[ "${answer,,}" == "y" ]] || exit 0
@@ -626,18 +555,8 @@ getData() {
     check_frontend_port
     info "Nginx 端口：$PORT"
 
-    default_backend_host="$(suggested_backend_host)"
     while true; do
-        read -r -p " 请输入后端回源地址[默认${default_backend_host}]：" BACKEND_HOST
-        BACKEND_HOST="${BACKEND_HOST:-$default_backend_host}"
-        if is_valid_backend_host "$BACKEND_HOST"; then
-            break
-        fi
-        colorEcho "$RED" " 后端地址格式不合法，请重新输入！"
-    done
-
-    while true; do
-        read -r -p " 请输入后端回源端口[1-65535]：" BACKEND_PORT
+        read -r -p " 请输入后端监听端口[1-65535]：" BACKEND_PORT
         [[ "$BACKEND_PORT" =~ ^[0-9]+$ ]] || {
             colorEcho "$RED" " 后端端口必须是数字"
             continue
@@ -653,12 +572,9 @@ getData() {
         break
     done
 
-    normalize_backend_host
-    info "后端回源：${BACKEND_HOST}:${BACKEND_PORT}"
-    if [[ "$BACKEND_HOST" == "127.0.0.1" ]] && ! has_ipv4_loopback; then
-        warn "当前系统似乎不可用 127.0.0.1，建议改填服务器实际 IP：${IPV4:-请手动填写}"
-    fi
-    check_backend_target
+    info "后端监听端口：${BACKEND_PORT}"
+    info "监听地址由后端自己处理，本脚本不要求手动填写"
+    check_backend_port
 
     collect_transport_data
 
@@ -823,7 +739,7 @@ configNginx() {
         transport_block="location ${WS_PATH} {
         proxy_redirect off;
         proxy_read_timeout 1200s;
-        proxy_pass http://${BACKEND_HOST_NGINX}:${BACKEND_PORT};
+        proxy_pass http://127.0.0.1:${BACKEND_PORT};
         proxy_http_version 1.1;
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection \"upgrade\";
@@ -839,7 +755,7 @@ configNginx() {
         grpc_read_timeout 1200s;
         grpc_send_timeout 1200s;
         grpc_socket_keepalive on;
-        grpc_pass grpc://${BACKEND_HOST_NGINX}:${BACKEND_PORT};
+        grpc_pass grpc://127.0.0.1:${BACKEND_PORT};
     }
 
     location ^~ /${GRPC_SERVICE}/TunMulti {
@@ -849,7 +765,7 @@ configNginx() {
         grpc_read_timeout 1200s;
         grpc_send_timeout 1200s;
         grpc_socket_keepalive on;
-        grpc_pass grpc://${BACKEND_HOST_NGINX}:${BACKEND_PORT};
+        grpc_pass grpc://127.0.0.1:${BACKEND_PORT};
     }"
     fi
 
@@ -859,7 +775,7 @@ configNginx() {
 
     cat > "$tmp_conf" <<EOF_NGINX_SITE
 # Managed by v2pr
-# Backend: ${BACKEND_HOST}:${BACKEND_PORT}
+# Backend port: ${BACKEND_PORT}
 server {
     listen 80;
     listen [::]:80;
@@ -1015,11 +931,11 @@ installTemplate() {
 
 showSummary() {
     echo ""
-    success "安装完成，入口 ${DOMAIN}:${PORT} 已反代到 ${BACKEND_HOST}:${BACKEND_PORT}"
+    success "安装完成，入口 ${DOMAIN}:${PORT} 已反代到本机后端端口 ${BACKEND_PORT}"
     success "----------- 关键参数 -----------------------------"
     colorEcho "$RED"   " 域名(SNI)：${DOMAIN}"
     colorEcho "$RED"   " 用户连接端口：${PORT}"
-    colorEcho "$RED"   " 后端回源：${BACKEND_HOST}:${BACKEND_PORT}"
+    colorEcho "$RED"   " 后端监听端口：${BACKEND_PORT}"
     colorEcho "$RED"   " 传输安全：tls"
     colorEcho "$RED"   " 传输协议：${MODE}"
 
@@ -1053,7 +969,7 @@ showSummary() {
         info "后续可直接运行命令：${SHORTCUT_CMD}"
         info "更新脚本命令：${SHORTCUT_CMD} update"
     fi
-    info "如果后端与 Nginx 在同一台机器上，建议后端只监听 127.0.0.1 / ::1"
+    info "监听地址由后端自己处理，本脚本只按本机后端端口反代"
 }
 
 postCheck() {
@@ -1065,12 +981,10 @@ postCheck() {
         fi
     fi
 
-    if backend_is_local; then
-        if is_port_in_use "$BACKEND_PORT"; then
-            success "已确认本机后端端口 ${BACKEND_PORT} 正在监听"
-        else
-            warn "未检测到本机后端端口 ${BACKEND_PORT} 正在监听，请确认后端已启动"
-        fi
+    if is_port_in_use "$BACKEND_PORT"; then
+        success "已确认本机后端端口 ${BACKEND_PORT} 正在监听"
+    else
+        warn "未检测到本机后端端口 ${BACKEND_PORT} 正在监听，请确认后端已启动"
     fi
 }
 
