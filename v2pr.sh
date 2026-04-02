@@ -43,6 +43,9 @@ DEFAULT_PROXY_URL="https://bing.ioliu.cn"
 BACKEND_LOCK_RESULT="未设置"
 FIREWALL_TOOL=""
 FIREWALL_POLICY_RESULT="未设置"
+SHORTCUT_CMD="v2pr"
+SHORTCUT_PATH="/usr/local/bin/${SHORTCUT_CMD}"
+PROJECT_REPO_URL="https://github.com/limo13660/v2bx-proxy"
 
 colorEcho() {
     echo -e "${1}${@:2}${PLAIN}"
@@ -67,6 +70,125 @@ success() {
 
 command_exists() {
     command -v "$1" >/dev/null 2>&1
+}
+
+validate_script_file() {
+    local file="$1"
+
+    [[ -s "$file" ]] || return 1
+    grep -q '^#!/usr/bin/env bash' "$file" 2>/dev/null || return 1
+    bash -n "$file" >/dev/null 2>&1 || return 1
+}
+
+download_latest_script_to_file() {
+    local outfile="$1"
+    local url=""
+    local -a update_urls=(
+        "https://raw.githubusercontent.com/limo13660/v2bx-proxy/main/v2pr.sh"
+        "https://raw.githubusercontent.com/limo13660/v2bx-proxy/master/v2pr.sh"
+    )
+
+    rm -f "$outfile"
+
+    for url in "${update_urls[@]}"; do
+        info "尝试下载脚本：$url"
+        if ! safe_wget "$url" "$outfile"; then
+            warn "下载失败：$url"
+            continue
+        fi
+
+        if validate_script_file "$outfile"; then
+            return 0
+        fi
+
+        warn "下载内容不是有效脚本：$url"
+        rm -f "$outfile"
+    done
+
+    return 1
+}
+
+install_shortcut_from_file() {
+    local source_file="$1"
+    local tmp_target="${SHORTCUT_PATH}.tmp.$$"
+
+    [[ -r "$source_file" ]] || return 1
+    mkdir -p "$(dirname "$SHORTCUT_PATH")" || return 1
+
+    cat "$source_file" > "$tmp_target" || {
+        rm -f "$tmp_target"
+        return 1
+    }
+    chmod 755 "$tmp_target" || {
+        rm -f "$tmp_target"
+        return 1
+    }
+    mv -f "$tmp_target" "$SHORTCUT_PATH" || {
+        rm -f "$tmp_target"
+        return 1
+    }
+}
+
+install_shortcut_command() {
+    local script_source="${BASH_SOURCE[0]:-$0}"
+    local tmpfile=""
+    local source_file=""
+
+    if [[ "$script_source" == "$SHORTCUT_PATH" ]]; then
+        return 0
+    fi
+
+    case "$script_source" in
+        /dev/fd/*|/proc/*|"")
+            tmpfile="/tmp/${SHORTCUT_CMD}.install.$$"
+            download_latest_script_to_file "$tmpfile" || {
+                warn "当前通过临时输入流运行脚本，且未能从项目仓库下载完整脚本，跳过快捷命令安装"
+                [[ -n "$tmpfile" ]] && rm -f "$tmpfile"
+                return 1
+            }
+            source_file="$tmpfile"
+            ;;
+        *)
+            if [[ ! -r "$script_source" ]]; then
+                warn "未能读取当前脚本内容，跳过快捷命令安装"
+                return 1
+            fi
+            source_file="$script_source"
+            ;;
+    esac
+
+    if [[ -f "$SHORTCUT_PATH" ]] && cmp -s "$source_file" "$SHORTCUT_PATH" 2>/dev/null; then
+        [[ -n "$tmpfile" ]] && rm -f "$tmpfile"
+        return 0
+    fi
+
+    install_shortcut_from_file "$source_file" || {
+        warn "快捷命令安装失败：无法写入 ${SHORTCUT_PATH}"
+        [[ -n "$tmpfile" ]] && rm -f "$tmpfile"
+        return 1
+    }
+
+    [[ -n "$tmpfile" ]] && rm -f "$tmpfile"
+    success "已安装快捷命令：${SHORTCUT_CMD}"
+    return 0
+}
+
+update_script() {
+    echo ""
+    info "开始更新脚本..."
+
+    local tmpfile="/tmp/${SHORTCUT_CMD}.update.$$"
+    download_latest_script_to_file "$tmpfile" || die "脚本更新失败：无法从项目地址下载有效更新，请检查网络或仓库地址"
+
+    install_shortcut_from_file "$tmpfile" || {
+        rm -f "$tmpfile"
+        die "更新失败：无法写入 ${SHORTCUT_PATH}"
+    }
+
+    rm -f "$tmpfile"
+    success "脚本更新完成，可直接运行：${SHORTCUT_CMD}"
+    info "项目地址：${PROJECT_REPO_URL}"
+    return 0
 }
 
 fetch_public_ip() {
@@ -1352,6 +1474,10 @@ showSummary() {
     info "伪装站点：${PROXY_URL:-/usr/share/nginx/html 本地站点}"
     info "防火墙策略：${FIREWALL_POLICY_RESULT}"
     info "后端端口防护：${BACKEND_LOCK_RESULT}"
+    if [[ -x "$SHORTCUT_PATH" ]]; then
+        info "后续可直接运行命令：${SHORTCUT_CMD}"
+        info "更新脚本命令：${SHORTCUT_CMD} update"
+    fi
     show_listenip_reminder
     if [[ "$MODE" == "ws" ]]; then
         info "建议面板主协议使用 Trojan，传输改为 network=ws、security=tls、path=${WSPATH}、host=${DOMAIN}。"
@@ -1568,6 +1694,7 @@ menu() {
     echo -e "  ${GREEN}2.${PLAIN}   检测并删除某个域名的反代配置"
     echo -e "  ${GREEN}3.${PLAIN}   查看当前服务状态"
     echo -e "  ${GREEN}4.${PLAIN}   检测 ListenIP 与后端端口暴露"
+    echo -e "  ${GREEN}5.${PLAIN}   更新脚本"
     echo -e "  ${GREEN}0.${PLAIN}   退出"
     echo ""
 
@@ -1577,12 +1704,14 @@ menu() {
         2) uninstall_proxy ;;
         3) show_status ;;
         4) detect_listenip_status ;;
+        5) update_script ;;
         0) exit 0 ;;
         *) die "请选择正确的操作！" ;;
     esac
 }
 
 checkSystem
+install_shortcut_command || true
 
 action="${1:-menu}"
 case "$action" in
@@ -1601,9 +1730,12 @@ case "$action" in
     detect)
         detect_listenip_status
         ;;
+    update)
+        update_script
+        ;;
     *)
         echo "参数错误"
-        echo "用法: $(basename "$0") [menu|install|uninstall_proxy|status|detect]"
+        echo "用法: $(basename "$0") [menu|install|uninstall_proxy|status|detect|update]"
         exit 1
         ;;
 esac
