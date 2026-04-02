@@ -1563,6 +1563,7 @@ pick_site_conf() {
 }
 
 install_proxy() {
+    checkV2bX
     getData
 
     if [[ "$PMT" == "apt" ]]; then
