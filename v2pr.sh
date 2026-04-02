@@ -889,7 +889,7 @@ installTemplate() {
     local extracted="false"
     local url=""
     local -a template_urls=(
-        "https://raw.githubusercontent.com/limo13660/xr-proxy/main/html_template.zip"
+        "https://raw.githubusercontent.com/limo13660/v2bx-proxy/main/html_template.zip"
         "https://github.com/limo13660/xr-proxy/archive/refs/heads/main.tar.gz"
         "https://codeload.github.com/limo13660/xr-proxy/tar.gz/refs/heads/main"
     )
