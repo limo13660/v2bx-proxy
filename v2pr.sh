@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Generic Nginx reverse proxy installer (WS/gRPC + TLS)
+# V2bX Nginx reverse proxy installer (WS/gRPC + TLS)
+# Purpose: merge ws.sh and grpc.sh into one script without changing originals.
+# Scope: reliability, rollback safety, maintainability, and DNS-only cert issuance.
 
 set -u
 set -o pipefail
@@ -10,6 +12,8 @@ YELLOW="\033[33m"
 BLUE="\033[36m"
 PLAIN='\033[0m'
 
+V2BX_BIN="/usr/local/V2bX/V2bX"
+V2BX_SERVICE="V2bX"
 NGINX_CONF_PATH="/etc/nginx/conf.d/"
 BT="false"
 PMT=""
@@ -20,19 +24,25 @@ IPV4=""
 IPV6=""
 IP=""
 PORT=""
-BACKEND_PORT=""
+V2PORT=""
 DOMAIN=""
 MODE=""
-WS_PATH=""
+WSPATH=""
 GRPC_SERVICE=""
+STACK_HINT="Trojan + gRPC + TLS + Nginx + 真网站"
 CERT_FILE=""
 KEY_FILE=""
 REMOTE_HOST=""
 PROXY_URL=""
 ALLOW_SPIDER="n"
+NEED_BBR="n"
+INSTALL_BBR="false"
 SITE_CONF=""
 ROBOT_CONFIG=""
 DEFAULT_PROXY_URL="https://bing.ioliu.cn"
+BACKEND_LOCK_RESULT="未设置"
+FIREWALL_TOOL=""
+FIREWALL_POLICY_RESULT="未设置"
 SHORTCUT_CMD="v2pr"
 SHORTCUT_PATH="/usr/local/bin/${SHORTCUT_CMD}"
 PROJECT_REPO_URL="https://github.com/limo13660/v2bx-proxy"
@@ -342,6 +352,16 @@ startNginx() {
     fi
 }
 
+stopNginx() {
+    if [[ "$BT" == "false" ]]; then
+        systemctl stop nginx >/dev/null 2>&1 || true
+    else
+        if pgrep -x nginx >/dev/null 2>&1; then
+            nginx -s stop >/dev/null 2>&1 || true
+        fi
+    fi
+}
+
 reloadNginx() {
     if [[ "$BT" == "false" ]]; then
         systemctl reload nginx
@@ -393,15 +413,10 @@ suggested_grpc_service() {
 }
 
 check_backend_port() {
-    if [[ "$PORT" == "$BACKEND_PORT" ]]; then
-        die "前端监听端口与后端监听端口不能相同"
-    fi
+    [[ "$PORT" != "$V2PORT" ]] || die "Nginx 监听端口与后端服务端口不能相同"
 
-    if is_port_in_use "$BACKEND_PORT"; then
-        info "检测到本机后端端口 ${BACKEND_PORT} 正在监听"
-    else
-        warn "当前未检测到本机后端端口 ${BACKEND_PORT} 正在监听"
-        warn "脚本仍会继续写入 Nginx 配置；如果后续回源失败，请先确认后端已经启动并监听该端口"
+    if is_port_in_use "$V2PORT"; then
+        die "后端服务端口 ${V2PORT} 已被占用，请更换一个未使用端口"
     fi
 }
 
@@ -438,6 +453,36 @@ checkSystem() {
     IP="${IPV4:-$IPV6}"
 }
 
+checkV2bX() {
+    if [[ -x "$V2BX_BIN" ]]; then
+        return 0
+    fi
+    if systemctl list-unit-files | grep -q '^V2bX\.service'; then
+        return 0
+    fi
+    die "未检测到 V2bX，请先安装 V2bX 再运行此脚本"
+}
+
+restartV2bX() {
+    if systemctl list-unit-files | grep -q '^V2bX\.service'; then
+        systemctl restart "$V2BX_SERVICE" || return 1
+        return 0
+    fi
+    if command_exists service; then
+        service "$V2BX_SERVICE" restart || return 1
+        return 0
+    fi
+    return 1
+}
+
+statusV2bX() {
+    if systemctl list-unit-files | grep -q '^V2bX\.service'; then
+        systemctl is-active --quiet "$V2BX_SERVICE"
+        return $?
+    fi
+    return 1
+}
+
 resolve_domain_to_server() {
     local host="$1"
     local resolved=""
@@ -471,7 +516,7 @@ choose_mode() {
     echo ""
     info "请选择反代协议："
     echo -e "  ${GREEN}1.${PLAIN} WS + TLS"
-    echo -e "  ${GREEN}2.${PLAIN} gRPC + TLS"
+    echo -e "  ${GREEN}2.${PLAIN} gRPC + TLS  ${YELLOW}(推荐，更适合 ${STACK_HINT})${PLAIN}"
 
     local answer
     read -r -p "请输入选项 [1-2，默认2]：" answer
@@ -488,17 +533,17 @@ collect_transport_data() {
     echo ""
     if [[ "$MODE" == "ws" ]]; then
         while true; do
-            read -r -p " 请输入 WS 路径，以 / 开头(不懂请直接回车)：" WS_PATH
-            if [[ -z "$WS_PATH" ]]; then
-                WS_PATH="$(suggested_ws_path)"
+            read -r -p " 请输入伪装路径，以 / 开头(不懂请直接回车)：" WSPATH
+            if [[ -z "$WSPATH" ]]; then
+                WSPATH="$(suggested_ws_path)"
                 break
-            elif ! is_valid_ws_path "$WS_PATH"; then
-                colorEcho "$RED" " WS 路径不合法，请重新输入！"
+            elif ! is_valid_ws_path "$WSPATH"; then
+                colorEcho "$RED" " 伪装路径不合法，请重新输入！"
             else
                 break
             fi
         done
-        info "WS 路径：$WS_PATH"
+        info "WS 路径：$WSPATH"
     else
         while true; do
             read -r -p " 请输入 gRPC serviceName(仅字母/数字/._-，不懂请直接回车)：" GRPC_SERVICE
@@ -521,8 +566,9 @@ getData() {
     echo " 运行之前请确认如下条件已经具备："
     colorEcho "$YELLOW" "  1. 一个伪装域名 DNS 解析指向当前服务器 IP（${IP:-未检测到公网IP}）"
     colorEcho "$BLUE"   "  2. 证书将使用 Cloudflare DNS 模式申请，请提前准备可编辑 DNS 的 API Token"
-    colorEcho "$BLUE"   "  3. 你的后端已准备好使用 WS 或 gRPC，并监听在你将要填写的后端端口上"
-    colorEcho "$BLUE"   "  4. 监听地址由后端自己处理，本脚本只负责 Nginx 反代和 TLS"
+    colorEcho "$BLUE"   "  3. 面板 / V2bX 节点传输协议需要与本脚本中选择的模式保持一致，客户端外显地址请使用域名而非服务器 IP"
+    colorEcho "$BLUE"   "  4. 后端服务端口仅供本机 / Nginx 回源使用，不应暴露到公网"
+    colorEcho "$BLUE"   "  5. 若想尽量贴近正常流量，建议上游节点协议选 Trojan，传输选 gRPC，端口优先 443，并给域名准备一个真网站首页"
     echo ""
     read -r -p " 确认满足按 y，按其他退出脚本：" answer
     [[ "${answer,,}" == "y" ]] || exit 0
@@ -555,26 +601,14 @@ getData() {
     check_frontend_port
     info "Nginx 端口：$PORT"
 
-    while true; do
-        read -r -p " 请输入后端监听端口[1-65535]：" BACKEND_PORT
-        [[ "$BACKEND_PORT" =~ ^[0-9]+$ ]] || {
-            colorEcho "$RED" " 后端端口必须是数字"
-            continue
-        }
-        (( BACKEND_PORT >= 1 && BACKEND_PORT <= 65535 )) || {
-            colorEcho "$RED" " 后端端口范围错误"
-            continue
-        }
-        [[ "${BACKEND_PORT:0:1}" != "0" ]] || {
-            colorEcho "$RED" " 端口不能以 0 开头"
-            continue
-        }
-        break
-    done
-
-    info "后端监听端口：${BACKEND_PORT}"
-    info "监听地址由后端自己处理，本脚本不要求手动填写"
+    read -r -p " 请输入服务端口(后端监听端口，仅供本机/Nginx回源，不对公网开放)[10000-65535，默认随机]：" V2PORT
+    [[ -z "$V2PORT" ]] && V2PORT="$(shuf -i 10000-65000 -n 1)"
+    [[ "$V2PORT" =~ ^[0-9]+$ ]] || die "后端端口必须是数字"
+    (( V2PORT >= 10000 && V2PORT <= 65535 )) || die "后端端口范围错误"
+    [[ "${V2PORT:0:1}" != "0" ]] || die "端口不能以 0 开头"
     check_backend_port
+    info "后端服务端口：$V2PORT"
+    info "该端口仅供本机 / Nginx 回源使用，脚本会尝试自动拒绝公网直连"
 
     collect_transport_data
 
@@ -612,6 +646,12 @@ getData() {
         ALLOW_SPIDER="n"
     fi
     info "允许搜索引擎：$ALLOW_SPIDER"
+
+    echo ""
+    read -r -p " 是否安装 BBR(默认不安装)? [y/n]: " NEED_BBR
+    [[ -z "$NEED_BBR" ]] && NEED_BBR="n"
+    [[ "${NEED_BBR,,}" == "y" ]] && NEED_BBR="y" || NEED_BBR="n"
+    info "安装 BBR：$NEED_BBR"
 }
 
 installNginx() {
@@ -736,10 +776,10 @@ configNginx() {
     fi
 
     if [[ "$MODE" == "ws" ]]; then
-        transport_block="location ${WS_PATH} {
+        transport_block="location ${WSPATH} {
         proxy_redirect off;
         proxy_read_timeout 1200s;
-        proxy_pass http://127.0.0.1:${BACKEND_PORT};
+        proxy_pass http://127.0.0.1:${V2PORT};
         proxy_http_version 1.1;
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection \"upgrade\";
@@ -755,7 +795,7 @@ configNginx() {
         grpc_read_timeout 1200s;
         grpc_send_timeout 1200s;
         grpc_socket_keepalive on;
-        grpc_pass grpc://127.0.0.1:${BACKEND_PORT};
+        grpc_pass grpc://127.0.0.1:${V2PORT};
     }
 
     location ^~ /${GRPC_SERVICE}/TunMulti {
@@ -765,7 +805,7 @@ configNginx() {
         grpc_read_timeout 1200s;
         grpc_send_timeout 1200s;
         grpc_socket_keepalive on;
-        grpc_pass grpc://127.0.0.1:${BACKEND_PORT};
+        grpc_pass grpc://127.0.0.1:${V2PORT};
     }"
     fi
 
@@ -774,8 +814,6 @@ configNginx() {
     fi
 
     cat > "$tmp_conf" <<EOF_NGINX_SITE
-# Managed by v2pr
-# Backend port: ${BACKEND_PORT}
 server {
     listen 80;
     listen [::]:80;
@@ -929,81 +967,561 @@ installTemplate() {
     rm -rf "$tmpfile" "$tmpdir" "$staged"
 }
 
+ensureFirewallTool() {
+    if [[ "$PMT" == "apt" ]]; then
+        if command_exists ufw; then
+            FIREWALL_TOOL="ufw"
+            return 0
+        fi
+        if command_exists firewall-cmd; then
+            FIREWALL_TOOL="firewalld"
+            return 0
+        fi
+    else
+        if command_exists firewall-cmd; then
+            FIREWALL_TOOL="firewalld"
+            return 0
+        fi
+        if command_exists ufw; then
+            FIREWALL_TOOL="ufw"
+            return 0
+        fi
+    fi
+
+    echo ""
+    if [[ "$PMT" == "apt" ]]; then
+        info "未检测到可用防火墙工具，开始自动安装 ufw..."
+        if $CMD_INSTALL ufw; then
+            command_exists ufw || die "ufw 安装后未检测到命令"
+            FIREWALL_TOOL="ufw"
+            success "已自动安装防火墙工具：ufw"
+            return 0
+        fi
+    else
+        info "未检测到可用防火墙工具，开始自动安装 firewalld..."
+        if $CMD_INSTALL firewalld; then
+            command_exists firewall-cmd || die "firewalld 安装后未检测到命令"
+            FIREWALL_TOOL="firewalld"
+            success "已自动安装防火墙工具：firewalld"
+            return 0
+        fi
+    fi
+
+    if command_exists iptables; then
+        FIREWALL_TOOL="iptables"
+        warn "自动安装防火墙工具失败，回退为 iptables 兼容模式"
+        return 0
+    fi
+
+    die "未能准备可用的防火墙工具，无法继续保护后端端口"
+}
+
+getFirewalldZone() {
+    local zone=""
+    zone="$(firewall-cmd --get-default-zone 2>/dev/null || true)"
+    echo "${zone:-public}"
+}
+
+configureFirewalldDefaultAllow() {
+    local zone=""
+
+    systemctl enable firewalld >/dev/null 2>&1 || true
+    systemctl start firewalld >/dev/null 2>&1 || die "firewalld 启动失败"
+
+    zone="$(getFirewalldZone)"
+    firewall-cmd --permanent --zone="$zone" --set-target=ACCEPT >/dev/null 2>&1 || die "firewalld 默认放行设置失败"
+    firewall-cmd --reload >/dev/null 2>&1 || die "firewalld 重载失败"
+
+    FIREWALL_POLICY_RESULT="firewalld 已启用，默认放行入站/出站流量，仅额外锁定后端端口"
+    success "已启用 firewalld，并设置默认放行流量"
+}
+
+configureUfwDefaultAllow() {
+    ufw default allow incoming >/dev/null 2>&1 || die "ufw 默认入站放行设置失败"
+    ufw default allow outgoing >/dev/null 2>&1 || die "ufw 默认出站放行设置失败"
+    ufw --force enable >/dev/null 2>&1 || die "ufw 启用失败"
+
+    FIREWALL_POLICY_RESULT="ufw 已启用，默认放行入站/出站流量，仅额外锁定后端端口"
+    success "已启用 ufw，并设置默认放行流量"
+}
+
+configureIptablesCompatibility() {
+    iptables -C INPUT -p tcp --dport 80 -j ACCEPT >/dev/null 2>&1 || iptables -I INPUT -p tcp --dport 80 -j ACCEPT
+    iptables -C INPUT -p tcp --dport 443 -j ACCEPT >/dev/null 2>&1 || iptables -I INPUT -p tcp --dport 443 -j ACCEPT
+    if [[ "$PORT" != "443" ]]; then
+        iptables -C INPUT -p tcp --dport "$PORT" -j ACCEPT >/dev/null 2>&1 || iptables -I INPUT -p tcp --dport "$PORT" -j ACCEPT
+    fi
+
+    FIREWALL_POLICY_RESULT="使用 iptables 兼容模式：已放行 80/443/前端端口，并继续锁定后端端口"
+    warn "当前回退为 iptables 兼容模式，未统一改动系统默认放行策略"
+}
+
+setFirewall() {
+    ensureFirewallTool
+
+    case "$FIREWALL_TOOL" in
+        firewalld)
+            configureFirewalldDefaultAllow
+            ;;
+        ufw)
+            configureUfwDefaultAllow
+            ;;
+        iptables)
+            configureIptablesCompatibility
+            ;;
+        *)
+            die "未知的防火墙工具：${FIREWALL_TOOL}"
+            ;;
+    esac
+}
+
+backendListensPublicly() {
+    local port="${1:-$V2PORT}"
+    local addr=""
+
+    while IFS= read -r addr; do
+        case "$addr" in
+            127.0.0.1:${port}|[::1]:${port}|::1:${port})
+                ;;
+            *:${port})
+                return 0
+                ;;
+        esac
+    done < <(get_port_listen_addresses "$port")
+
+    return 1
+}
+
+get_port_listen_addresses() {
+    local port="${1:-$V2PORT}"
+
+    if command_exists ss; then
+        ss -lnt 2>/dev/null | awk -v p=":${port}" 'NR>1 && $4 ~ p"$" {print $4}' | sort -u
+        return 0
+    fi
+
+    if command_exists netstat; then
+        netstat -lnt 2>/dev/null | awk -v p=":${port}" 'NR>2 && $4 ~ p"$" {print $4}' | sort -u
+        return 0
+    fi
+
+    return 1
+}
+
+lockBackendPortWithFirewalld() {
+    firewall-cmd --permanent --remove-port="${V2PORT}/tcp" >/dev/null 2>&1 || true
+
+    firewall-cmd --permanent --direct --remove-rule ipv4 filter INPUT 0 -i lo -p tcp --dport "$V2PORT" -j ACCEPT >/dev/null 2>&1 || true
+    firewall-cmd --permanent --direct --remove-rule ipv4 filter INPUT 1 ! -i lo -p tcp --dport "$V2PORT" -j DROP >/dev/null 2>&1 || true
+    firewall-cmd --permanent --direct --add-rule ipv4 filter INPUT 0 -i lo -p tcp --dport "$V2PORT" -j ACCEPT >/dev/null 2>&1 || return 1
+    firewall-cmd --permanent --direct --add-rule ipv4 filter INPUT 1 ! -i lo -p tcp --dport "$V2PORT" -j DROP >/dev/null 2>&1 || return 1
+
+    firewall-cmd --permanent --direct --remove-rule ipv6 filter INPUT 0 -i lo -p tcp --dport "$V2PORT" -j ACCEPT >/dev/null 2>&1 || true
+    firewall-cmd --permanent --direct --remove-rule ipv6 filter INPUT 1 ! -i lo -p tcp --dport "$V2PORT" -j DROP >/dev/null 2>&1 || true
+    firewall-cmd --permanent --direct --add-rule ipv6 filter INPUT 0 -i lo -p tcp --dport "$V2PORT" -j ACCEPT >/dev/null 2>&1 || true
+    firewall-cmd --permanent --direct --add-rule ipv6 filter INPUT 1 ! -i lo -p tcp --dport "$V2PORT" -j DROP >/dev/null 2>&1 || true
+
+    firewall-cmd --reload >/dev/null 2>&1 || return 1
+}
+
+lockBackendPortWithUfw() {
+    ufw --force delete allow in on lo to any port "$V2PORT" proto tcp >/dev/null 2>&1 || true
+    ufw --force delete deny "${V2PORT}/tcp" >/dev/null 2>&1 || true
+
+    ufw insert 1 allow in on lo to any port "$V2PORT" proto tcp >/dev/null 2>&1 || return 1
+    ufw insert 2 deny "${V2PORT}/tcp" >/dev/null 2>&1 || return 1
+}
+
+lockBackendPortWithIptables() {
+    iptables -C INPUT -i lo -p tcp --dport "$V2PORT" -j ACCEPT >/dev/null 2>&1 || iptables -I INPUT 1 -i lo -p tcp --dport "$V2PORT" -j ACCEPT >/dev/null 2>&1 || return 1
+    iptables -C INPUT ! -i lo -p tcp --dport "$V2PORT" -j DROP >/dev/null 2>&1 || iptables -I INPUT 2 ! -i lo -p tcp --dport "$V2PORT" -j DROP >/dev/null 2>&1 || return 1
+
+    if command_exists ip6tables; then
+        ip6tables -C INPUT -i lo -p tcp --dport "$V2PORT" -j ACCEPT >/dev/null 2>&1 || ip6tables -I INPUT 1 -i lo -p tcp --dport "$V2PORT" -j ACCEPT >/dev/null 2>&1 || true
+        ip6tables -C INPUT ! -i lo -p tcp --dport "$V2PORT" -j DROP >/dev/null 2>&1 || ip6tables -I INPUT 2 ! -i lo -p tcp --dport "$V2PORT" -j DROP >/dev/null 2>&1 || true
+    fi
+}
+
+protectBackendPort() {
+    case "$FIREWALL_TOOL" in
+        firewalld)
+            if lockBackendPortWithFirewalld; then
+                BACKEND_LOCK_RESULT="已通过 firewalld 限制仅本机可访问"
+                success "已通过 firewalld 拒绝公网直连后端端口 ${V2PORT}"
+                return 0
+            fi
+            ;;
+        ufw)
+            if lockBackendPortWithUfw; then
+                BACKEND_LOCK_RESULT="已通过 ufw 限制仅本机可访问"
+                success "已通过 ufw 拒绝公网直连后端端口 ${V2PORT}"
+                return 0
+            fi
+            ;;
+        iptables)
+            if lockBackendPortWithIptables; then
+                BACKEND_LOCK_RESULT="已通过 iptables 限制仅本机可访问（重启后请确认规则仍在）"
+                success "已通过 iptables 拒绝公网直连后端端口 ${V2PORT}"
+                return 0
+            fi
+            ;;
+    esac
+
+    BACKEND_LOCK_RESULT="未自动锁定，请手动限制仅 127.0.0.1 / ::1 可访问"
+    warn "已检测到防火墙工具 ${FIREWALL_TOOL:-unknown}，但未能自动锁定后端端口 ${V2PORT}"
+    warn "请手动限制仅 127.0.0.1 / ::1 可访问，避免客户端直连节点 IP"
+    return 1
+}
+
+extract_backend_port_from_conf() {
+    local conf="$1"
+
+    awk '
+        match($0, /127\.0\.0\.1:([0-9]+)/, m) {
+            print m[1]
+            exit
+        }
+    ' "$conf" 2>/dev/null
+}
+
+remove_backend_firewalld_rules() {
+    local port="$1"
+
+    command_exists firewall-cmd || return 1
+    systemctl is-active --quiet firewalld || return 1
+
+    firewall-cmd --permanent --remove-port="${port}/tcp" >/dev/null 2>&1 || true
+    firewall-cmd --permanent --direct --remove-rule ipv4 filter INPUT 0 -i lo -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1 || true
+    firewall-cmd --permanent --direct --remove-rule ipv4 filter INPUT 1 ! -i lo -p tcp --dport "$port" -j DROP >/dev/null 2>&1 || true
+    firewall-cmd --permanent --direct --remove-rule ipv6 filter INPUT 0 -i lo -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1 || true
+    firewall-cmd --permanent --direct --remove-rule ipv6 filter INPUT 1 ! -i lo -p tcp --dport "$port" -j DROP >/dev/null 2>&1 || true
+    firewall-cmd --reload >/dev/null 2>&1 || true
+    return 0
+}
+
+remove_backend_ufw_rules() {
+    local port="$1"
+
+    command_exists ufw || return 1
+
+    ufw --force delete allow in on lo to any port "$port" proto tcp >/dev/null 2>&1 || true
+    ufw --force delete deny "${port}/tcp" >/dev/null 2>&1 || true
+    return 0
+}
+
+remove_backend_iptables_rules() {
+    local port="$1"
+
+    command_exists iptables || return 1
+
+    while iptables -C INPUT -i lo -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1; do
+        iptables -D INPUT -i lo -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1 || break
+    done
+    while iptables -C INPUT ! -i lo -p tcp --dport "$port" -j DROP >/dev/null 2>&1; do
+        iptables -D INPUT ! -i lo -p tcp --dport "$port" -j DROP >/dev/null 2>&1 || break
+    done
+
+    if command_exists ip6tables; then
+        while ip6tables -C INPUT -i lo -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1; do
+            ip6tables -D INPUT -i lo -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1 || break
+        done
+        while ip6tables -C INPUT ! -i lo -p tcp --dport "$port" -j DROP >/dev/null 2>&1; do
+            ip6tables -D INPUT ! -i lo -p tcp --dport "$port" -j DROP >/dev/null 2>&1 || break
+        done
+    fi
+
+    return 0
+}
+
+cleanup_backend_firewall_rules() {
+    local port="$1"
+    local handled="false"
+
+    [[ "$port" =~ ^[0-9]+$ ]] || return 1
+
+    if remove_backend_firewalld_rules "$port"; then
+        handled="true"
+    fi
+    if remove_backend_ufw_rules "$port"; then
+        handled="true"
+    fi
+    if remove_backend_iptables_rules "$port"; then
+        handled="true"
+    fi
+
+    if [[ "$handled" == "true" ]]; then
+        success "已清理后端端口 ${port} 的防火墙规则"
+        return 0
+    fi
+
+    warn "未检测到可清理的防火墙工具，跳过后端端口 ${port} 的规则清理"
+    return 1
+}
+
+find_v2bx_config() {
+    local candidate=""
+    local exec_line=""
+    local token=""
+    local -a candidates=(
+        "/etc/V2bX/config.json"
+        "/usr/local/V2bX/config.json"
+        "/usr/local/V2bX/bin/config.json"
+    )
+
+    for candidate in "${candidates[@]}"; do
+        [[ -f "$candidate" ]] && {
+            echo "$candidate"
+            return 0
+        }
+    done
+
+    exec_line="$(systemctl cat "$V2BX_SERVICE" 2>/dev/null | awk -F= '/^ExecStart=/{print $2; exit}')"
+    for token in $exec_line; do
+        case "$token" in
+            *.json|*.yaml|*.yml)
+                [[ -f "$token" ]] && {
+                    echo "$token"
+                    return 0
+                }
+                ;;
+        esac
+    done
+
+    return 1
+}
+
+extract_listen_ips_from_config() {
+    local conf="$1"
+
+    awk '
+        match($0, /"ListenIP"[[:space:]]*:[[:space:]]*"([^"]+)"/, m) {
+            print m[1]
+        }
+    ' "$conf" 2>/dev/null
+}
+
+show_listenip_reminder() {
+    local conf=""
+    local listen_ip=""
+    local need_change="false"
+    local found_any="false"
+
+    conf="$(find_v2bx_config || true)"
+
+    if [[ -z "$conf" ]]; then
+        info "如需彻底避免后端端口直连，请把 V2bX 配置里的 ListenIP 改成 127.0.0.1，然后重启 V2bX。"
+        return 0
+    fi
+
+    while IFS= read -r listen_ip; do
+        [[ -n "$listen_ip" ]] || continue
+        found_any="true"
+        case "$listen_ip" in
+            127.0.0.1|::1)
+                ;;
+            *)
+                need_change="true"
+                ;;
+        esac
+    done < <(extract_listen_ips_from_config "$conf")
+
+    if [[ "$found_any" != "true" ]]; then
+        info "请检查 ${conf} 里的 ListenIP，建议改成 127.0.0.1 后重启 V2bX。"
+        return 0
+    fi
+
+    if [[ "$need_change" == "true" ]]; then
+        warn "检测到 V2bX 配置中的 ListenIP 仍非本地地址，请把 ${conf} 里的 ListenIP 改成 127.0.0.1 后重启 V2bX。"
+    else
+        success "V2bX 配置中的 ListenIP 已为本地地址"
+    fi
+}
+
+detect_listenip_status() {
+    checkV2bX
+
+    echo ""
+    info "开始检测 V2bX ListenIP 与后端端口监听状态..."
+
+    local conf=""
+    local listen_ip=""
+    local idx=1
+    local found_any="false"
+    local domain=""
+    local backend_port=""
+    local listen_addresses=""
+    local conf_path=""
+
+    conf="$(find_v2bx_config || true)"
+    if [[ -n "$conf" ]]; then
+        info "V2bX 配置文件：$conf"
+        while IFS= read -r listen_ip; do
+            [[ -n "$listen_ip" ]] || continue
+            found_any="true"
+            case "$listen_ip" in
+                127.0.0.1|::1)
+                    success "Node ${idx} ListenIP: ${listen_ip}"
+                    ;;
+                *)
+                    warn "Node ${idx} ListenIP: ${listen_ip}，建议改成 127.0.0.1"
+                    ;;
+            esac
+            idx=$((idx + 1))
+        done < <(extract_listen_ips_from_config "$conf")
+
+        [[ "$found_any" == "true" ]] || warn "未能从配置文件中解析到 ListenIP 字段"
+    else
+        warn "未定位到 V2bX 配置文件，请手动检查 ListenIP 是否为 127.0.0.1"
+    fi
+
+    echo ""
+    info "检测本脚本已创建反代的后端端口监听情况："
+    local found_site="false"
+    while IFS= read -r conf_path; do
+        [[ -n "$conf_path" ]] || continue
+        backend_port="$(extract_backend_port_from_conf "$conf_path" || true)"
+        [[ -n "$backend_port" ]] || continue
+
+        found_site="true"
+        domain="$(basename "$conf_path" .conf)"
+        listen_addresses="$(get_port_listen_addresses "$backend_port" | tr '\n' ',' | sed 's/,$//')"
+        [[ -n "$listen_addresses" ]] || listen_addresses="未检测到监听"
+
+        if backendListensPublicly "$backend_port"; then
+            warn "${domain}: 后端端口 ${backend_port} 正在公网地址监听 [${listen_addresses}]"
+        else
+            success "${domain}: 后端端口 ${backend_port} 仅本地监听 [${listen_addresses}]"
+        fi
+    done < <(list_site_confs)
+
+    [[ "$found_site" == "true" ]] || info "未检测到由本脚本创建的反代配置"
+
+    echo ""
+    show_listenip_reminder
+}
+
+installBBR() {
+    if [[ "$NEED_BBR" != "y" ]]; then
+        INSTALL_BBR="false"
+        return
+    fi
+
+    if lsmod | grep -q bbr; then
+        info "BBR 模块已安装"
+        INSTALL_BBR="false"
+        return
+    fi
+
+    if hostnamectl 2>/dev/null | grep -qi openvz; then
+        info "openvz 机器，跳过安装"
+        INSTALL_BBR="false"
+        return
+    fi
+
+    grep -q '^net.core.default_qdisc=fq$' /etc/sysctl.conf || echo 'net.core.default_qdisc=fq' >> /etc/sysctl.conf
+    grep -q '^net.ipv4.tcp_congestion_control=bbr$' /etc/sysctl.conf || echo 'net.ipv4.tcp_congestion_control=bbr' >> /etc/sysctl.conf
+    sysctl -p >/dev/null 2>&1 || true
+
+    if lsmod | grep -q bbr; then
+        success "BBR 模块已启用"
+        INSTALL_BBR="false"
+    else
+        warn "已写入 sysctl 参数，但当前内核未立即启用 BBR，可能需要重启"
+        INSTALL_BBR="true"
+    fi
+}
+
 showSummary() {
     echo ""
-    success "安装完成，入口 ${DOMAIN}:${PORT} 已反代到本机后端端口 ${BACKEND_PORT}"
+    success "安装完成，V2bX 内部回源端口为 ${V2PORT}，用户连接端口为 ${PORT}!"
     success "----------- 关键参数 -----------------------------"
-    colorEcho "$RED"   " 域名(SNI)：${DOMAIN}"
+    colorEcho "$RED"   " 推荐栈：${STACK_HINT}"
+    colorEcho "$RED"   " 服务/后端监听端口(仅本机回源)：${V2PORT}"
     colorEcho "$RED"   " 用户连接端口：${PORT}"
-    colorEcho "$RED"   " 后端监听端口：${BACKEND_PORT}"
+    colorEcho "$RED"   " 客户端连接地址：${DOMAIN}:${PORT}"
+    colorEcho "$RED"   " 域名(SNI)：${DOMAIN}"
     colorEcho "$RED"   " 传输安全：tls"
     colorEcho "$RED"   " 传输协议：${MODE}"
 
     echo ""
     if [[ "$MODE" == "ws" ]]; then
-        colorEcho "$RED" " WS 路径：${WS_PATH}"
+        success "---------- V2board / XBoard 传输协议配置示例 ----------------"
+        colorEcho "$RED"   "{"
+        colorEcho "$RED"   "  \"path\": \"${WSPATH}\","
+        colorEcho "$RED"   "  \"headers\": {"
+        colorEcho "$RED"   "    \"Host\": \"${DOMAIN}\""
+        colorEcho "$RED"   "  }"
+        colorEcho "$RED"   "}"
+
         echo ""
-        success "---------- 可直接复制的 WS 配置 -------------------"
-        colorEcho "$RED" " {"
-        colorEcho "$RED" "   \"path\": \"${WS_PATH}\","
-        colorEcho "$RED" "   \"headers\": {"
-        colorEcho "$RED" "     \"Host\": \"${DOMAIN}\""
-        colorEcho "$RED" "   }"
-        colorEcho "$RED" " }"
+        success "---------- SSPANEL 节点配置(首段建议填域名) -------"
+        colorEcho "$RED"   "${DOMAIN};${V2PORT};0;ws;tls;path=${WSPATH}|server=${DOMAIN}|host=${DOMAIN}|outside_port=${PORT}"
     else
-        colorEcho "$RED" " gRPC serviceName：${GRPC_SERVICE}"
-        colorEcho "$RED" " Nginx 分流路径：/${GRPC_SERVICE}/Tun"
-        colorEcho "$RED" " Nginx 分流路径：/${GRPC_SERVICE}/TunMulti"
+        success "---------- V2board / XBoard 传输协议配置示例 ----------------"
+        colorEcho "$RED"   "{"
+        colorEcho "$RED"   "  \"serviceName\": \"${GRPC_SERVICE}\""
+        colorEcho "$RED"   "}"
+
         echo ""
-        success "---------- 可直接复制的 gRPC 配置 -----------------"
-        colorEcho "$RED" " {"
-        colorEcho "$RED" "   \"serviceName\": \"${GRPC_SERVICE}\""
-        colorEcho "$RED" " }"
+        success "---------- Nginx 实际分流路径 -------------------------------"
+        colorEcho "$RED"   " /${GRPC_SERVICE}/Tun"
+        colorEcho "$RED"   " /${GRPC_SERVICE}/TunMulti"
     fi
 
     echo ""
     info "Nginx 配置文件：${SITE_CONF}"
     info "证书文件：${CERT_FILE}"
     info "伪装站点：${PROXY_URL:-/usr/share/nginx/html 本地站点}"
+    info "防火墙策略：${FIREWALL_POLICY_RESULT}"
+    info "后端端口防护：${BACKEND_LOCK_RESULT}"
     if [[ -x "$SHORTCUT_PATH" ]]; then
         info "后续可直接运行命令：${SHORTCUT_CMD}"
         info "更新脚本命令：${SHORTCUT_CMD} update"
     fi
-    info "监听地址由后端自己处理，本脚本只按本机后端端口反代"
+    show_listenip_reminder
+    if [[ "$MODE" == "ws" ]]; then
+        info "建议面板主协议使用 Trojan，传输改为 network=ws、security=tls、path=${WSPATH}、host=${DOMAIN}。"
+        info "客户端外显地址请使用 ${DOMAIN}:${PORT}，不要把 ${V2PORT} 直接暴露给客户端。"
+    else
+        info "建议面板主协议使用 Trojan，传输改为 network=grpc、security=tls、serviceName=${GRPC_SERVICE}。"
+        info "gRPC 由 Nginx 终止 TLS 后转发到 127.0.0.1:${V2PORT}，后端无需再次套 TLS。"
+        info "客户端外显地址请使用 ${DOMAIN}:${PORT}，不要把 ${V2PORT} 直接暴露给客户端。"
+    fi
+}
+
+bbrReboot() {
+    if [[ "$INSTALL_BBR" == "true" ]]; then
+        echo ""
+        warn "BBR 参数已写入；若仍未生效，请手动重启系统。"
+    fi
 }
 
 postCheck() {
+    local ok="true"
+
     if ! nginx_is_active; then
         if [[ "$BT" == "false" ]]; then
             warn "Nginx 当前未处于运行状态，请检查：systemctl status nginx"
         else
             warn "Nginx 当前未处于运行状态，请检查宝塔面板或执行 nginx -t / nginx -s reload"
         fi
+        ok="false"
     fi
 
-    if is_port_in_use "$BACKEND_PORT"; then
-        success "已确认本机后端端口 ${BACKEND_PORT} 正在监听"
-    else
-        warn "未检测到本机后端端口 ${BACKEND_PORT} 正在监听，请确认后端已启动"
+    if ! statusV2bX; then
+        warn "V2bX 当前未处于运行状态，请检查：systemctl status V2bX"
+        ok="false"
     fi
+
+    if backendListensPublicly; then
+        warn "检测到后端端口 ${V2PORT} 正在非本地地址监听"
+        warn "脚本已尝试通过防火墙阻断公网直连，但仍建议把 V2bX 改为仅监听 127.0.0.1 / ::1"
+    fi
+
+    [[ "$ok" == "true" ]]
 }
 
 list_site_confs() {
-    local conf=""
-    local found_managed="false"
-
-    while IFS= read -r conf; do
-        [[ -n "$conf" ]] || continue
-        if grep -Fq '# Managed by v2pr' "$conf" 2>/dev/null; then
-            echo "$conf"
-            found_managed="true"
-        fi
-    done < <(find "$NGINX_CONF_PATH" -maxdepth 1 -type f -name '*.conf' ! -name '*.bak' ! -name '*.tmp' 2>/dev/null | sort)
-
-    if [[ "$found_managed" == "true" ]]; then
-        return 0
-    fi
-
     find "$NGINX_CONF_PATH" -maxdepth 1 -type f -name '*.conf' ! -name '*.bak' ! -name '*.tmp' 2>/dev/null | sort
 }
 
@@ -1061,9 +1579,12 @@ install_proxy() {
     command_exists unzip || die "unzip 安装失败，请检查网络"
 
     installNginx
+    setFirewall
+    protectBackendPort || true
     getCert
     installTemplate
     configNginx
+    installBBR
 
     if nginx_is_active; then
         reloadNginx || die "Nginx 重载失败"
@@ -1071,8 +1592,20 @@ install_proxy() {
         startNginx || die "Nginx 启动失败"
     fi
 
+    if restartV2bX; then
+        sleep 2
+        if statusV2bX; then
+            success "V2bX 重启成功"
+        else
+            warn "V2bX 已尝试重启，但当前状态未确认，请用 systemctl status V2bX 检查"
+        fi
+    else
+        warn "V2bX 重启失败，请手动执行 systemctl restart V2bX"
+    fi
+
     showSummary
     postCheck || true
+    bbrReboot
 }
 
 uninstall_proxy() {
@@ -1082,7 +1615,10 @@ uninstall_proxy() {
     }
 
     local conf="$SITE_CONF"
+    local backend_port=""
     [[ -f "$conf" ]] || die "未找到配置文件：$conf"
+
+    backend_port="$(extract_backend_port_from_conf "$conf" || true)"
 
     local cert_pem="/etc/ysbl/${DOMAIN}.pem"
     local cert_key="/etc/ysbl/${DOMAIN}.key"
@@ -1112,6 +1648,12 @@ uninstall_proxy() {
         die "删除后 Nginx 配置校验失败，已自动回滚"
     fi
 
+    if [[ -n "$backend_port" ]]; then
+        cleanup_backend_firewall_rules "$backend_port" || true
+    else
+        warn "未能从配置中识别后端端口，已跳过防火墙规则清理"
+    fi
+
     if [[ -f "$cert_pem" || -f "$cert_key" ]]; then
         echo ""
         read -r -p "是否一并删除 /etc/ysbl 下该域名证书文件？[y/N]：" answer
@@ -1126,25 +1668,32 @@ uninstall_proxy() {
 
 show_status() {
     echo ""
+    if statusV2bX; then
+        success "V2bX: 运行中"
+    else
+        warn "V2bX: 未运行或未检测到"
+    fi
+
     if nginx_is_active; then
         success "Nginx: 运行中"
     else
         warn "Nginx: 未运行"
     fi
 
-    info "站点配置目录：${NGINX_CONF_PATH}"
+    show_listenip_reminder
 }
 
 menu() {
     clear
     echo "================================"
-    echo "      通用 Nginx 反代脚本       "
+    echo "     V2bX 一键添加 Nginx 反代     "
     echo "================================"
     echo ""
-    echo -e "  ${GREEN}1.${PLAIN}   安装 Nginx 反代(WS/gRPC + TLS)"
+    echo -e "  ${GREEN}1.${PLAIN}   为 V2bX 添加 Nginx 反代(WS/gRPC + TLS)"
     echo -e "  ${GREEN}2.${PLAIN}   检测并删除某个域名的反代配置"
     echo -e "  ${GREEN}3.${PLAIN}   查看当前服务状态"
-    echo -e "  ${GREEN}4.${PLAIN}   更新脚本"
+    echo -e "  ${GREEN}4.${PLAIN}   检测 ListenIP 与后端端口暴露"
+    echo -e "  ${GREEN}5.${PLAIN}   更新脚本"
     echo -e "  ${GREEN}0.${PLAIN}   退出"
     echo ""
 
@@ -1153,7 +1702,8 @@ menu() {
         1) install_proxy ;;
         2) uninstall_proxy ;;
         3) show_status ;;
-        4) update_script ;;
+        4) detect_listenip_status ;;
+        5) update_script ;;
         0) exit 0 ;;
         *) die "请选择正确的操作！" ;;
     esac
@@ -1170,21 +1720,21 @@ case "$action" in
     install)
         install_proxy
         ;;
-    uninstall)
-        uninstall_proxy
-        ;;
     uninstall_proxy)
         uninstall_proxy
         ;;
     status)
         show_status
         ;;
+    detect)
+        detect_listenip_status
+        ;;
     update)
         update_script
         ;;
     *)
         echo "参数错误"
-        echo "用法: $(basename "$0") [menu|install|uninstall|uninstall_proxy|status|update]"
+        echo "用法: $(basename "$0") [menu|install|uninstall_proxy|status|detect|update]"
         exit 1
         ;;
 esac
