@@ -974,8 +974,21 @@ showSummary() {
     echo ""
     if [[ "$MODE" == "ws" ]]; then
         colorEcho "$RED" " WS 路径：${WS_PATH}"
+        echo ""
+        success "---------- 可直接复制的 WS 配置 -------------------"
+        colorEcho "$RED" " {"
+        colorEcho "$RED" "   \"path\": \"${WS_PATH}\","
+        colorEcho "$RED" "   \"headers\": {"
+        colorEcho "$RED" "     \"Host\": \"${DOMAIN}\""
+        colorEcho "$RED" "   }"
+        colorEcho "$RED" " }"
     else
         colorEcho "$RED" " gRPC 路径前缀：/${GRPC_SERVICE}/"
+        echo ""
+        success "---------- 可直接复制的 gRPC 配置 -----------------"
+        colorEcho "$RED" " {"
+        colorEcho "$RED" "   \"serviceName\": \"${GRPC_SERVICE}\""
+        colorEcho "$RED" " }"
     fi
 
     echo ""
