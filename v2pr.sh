@@ -374,6 +374,41 @@ is_valid_backend_host() {
     [[ "$1" =~ ^[A-Za-z0-9._:-]+$ ]]
 }
 
+has_ipv4_loopback() {
+    if command_exists ip; then
+        ip -4 addr show dev lo 2>/dev/null | grep -q '127\.0\.0\.1/' && return 0
+    fi
+
+    if command_exists ifconfig; then
+        ifconfig lo 2>/dev/null | grep -q '127\.0\.0\.1' && return 0
+    fi
+
+    if command_exists ping; then
+        ping -4 -c 1 -W 1 127.0.0.1 >/dev/null 2>&1 && return 0
+    fi
+
+    return 1
+}
+
+suggested_backend_host() {
+    if has_ipv4_loopback; then
+        echo "127.0.0.1"
+        return 0
+    fi
+
+    if [[ -n "$IPV4" ]]; then
+        echo "$IPV4"
+        return 0
+    fi
+
+    if [[ -n "$IPV6" ]]; then
+        echo "$IPV6"
+        return 0
+    fi
+
+    echo "127.0.0.1"
+}
+
 normalize_backend_host() {
     BACKEND_HOST_NGINX="$BACKEND_HOST"
 
@@ -535,21 +570,24 @@ collect_transport_data() {
         info "WS 路径：$WS_PATH"
     else
         while true; do
-            read -r -p " 请输入 gRPC serviceName / 路径前缀(仅字母/数字/._-，不懂请直接回车)：" GRPC_SERVICE
+            read -r -p " 请输入 gRPC serviceName(仅字母/数字/._-，不懂请直接回车)：" GRPC_SERVICE
             if [[ -z "$GRPC_SERVICE" ]]; then
                 GRPC_SERVICE="$(suggested_grpc_service)"
                 break
             elif ! is_valid_grpc_service "$GRPC_SERVICE"; then
-                colorEcho "$RED" " gRPC 路径前缀不合法，请重新输入！"
+                colorEcho "$RED" " gRPC serviceName 不合法，请重新输入！"
             else
                 break
             fi
         done
-        info "gRPC 路径前缀：/${GRPC_SERVICE}/"
+        info "gRPC serviceName：$GRPC_SERVICE"
+        info "Nginx 将转发路径：/${GRPC_SERVICE}/Tun 和 /${GRPC_SERVICE}/TunMulti"
     fi
 }
 
 getData() {
+    local default_backend_host=""
+
     echo ""
     echo " 运行之前请确认如下条件已经具备："
     colorEcho "$YELLOW" "  1. 一个伪装域名 DNS 解析指向当前服务器 IP（${IP:-未检测到公网IP}）"
@@ -588,9 +626,10 @@ getData() {
     check_frontend_port
     info "Nginx 端口：$PORT"
 
+    default_backend_host="$(suggested_backend_host)"
     while true; do
-        read -r -p " 请输入后端回源地址[默认127.0.0.1]：" BACKEND_HOST
-        BACKEND_HOST="${BACKEND_HOST:-127.0.0.1}"
+        read -r -p " 请输入后端回源地址[默认${default_backend_host}]：" BACKEND_HOST
+        BACKEND_HOST="${BACKEND_HOST:-$default_backend_host}"
         if is_valid_backend_host "$BACKEND_HOST"; then
             break
         fi
@@ -616,6 +655,9 @@ getData() {
 
     normalize_backend_host
     info "后端回源：${BACKEND_HOST}:${BACKEND_PORT}"
+    if [[ "$BACKEND_HOST" == "127.0.0.1" ]] && ! has_ipv4_loopback; then
+        warn "当前系统似乎不可用 127.0.0.1，建议改填服务器实际 IP：${IPV4:-请手动填写}"
+    fi
     check_backend_target
 
     collect_transport_data
@@ -790,7 +832,17 @@ configNginx() {
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
     }"
     else
-        transport_block="location ^~ /${GRPC_SERVICE}/ {
+        transport_block="location ^~ /${GRPC_SERVICE}/Tun {
+        grpc_set_header X-Real-IP \$remote_addr;
+        grpc_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        grpc_set_header Host \$host;
+        grpc_read_timeout 1200s;
+        grpc_send_timeout 1200s;
+        grpc_socket_keepalive on;
+        grpc_pass grpc://${BACKEND_HOST_NGINX}:${BACKEND_PORT};
+    }
+
+    location ^~ /${GRPC_SERVICE}/TunMulti {
         grpc_set_header X-Real-IP \$remote_addr;
         grpc_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         grpc_set_header Host \$host;
@@ -983,7 +1035,9 @@ showSummary() {
         colorEcho "$RED" "   }"
         colorEcho "$RED" " }"
     else
-        colorEcho "$RED" " gRPC 路径前缀：/${GRPC_SERVICE}/"
+        colorEcho "$RED" " gRPC serviceName：${GRPC_SERVICE}"
+        colorEcho "$RED" " Nginx 分流路径：/${GRPC_SERVICE}/Tun"
+        colorEcho "$RED" " Nginx 分流路径：/${GRPC_SERVICE}/TunMulti"
         echo ""
         success "---------- 可直接复制的 gRPC 配置 -----------------"
         colorEcho "$RED" " {"
