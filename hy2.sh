@@ -155,6 +155,38 @@ find_template_dir() {
     return 1
 }
 
+find_template_archive() {
+    local base="$1"
+    local found=""
+
+    if [[ -f "$base/html_template.zip" ]]; then
+        echo "$base/html_template.zip"
+        return 0
+    fi
+
+    found="$(find "$base" -mindepth 1 -maxdepth 4 -type f -name 'html_template.zip' 2>/dev/null | head -n 1)"
+    if [[ -n "$found" ]]; then
+        echo "$found"
+        return 0
+    fi
+
+    return 1
+}
+
+template_has_index() {
+    local base="$1"
+    [[ -f "$base/index.html" || -f "$base/index.htm" ]]
+}
+
+normalize_web_permissions() {
+    local web_root="/usr/share/nginx/html"
+
+    [[ -d "$web_root" ]] || return 0
+
+    find "$web_root" -type d -exec chmod 755 {} + >/dev/null 2>&1 || true
+    find "$web_root" -type f -exec chmod 644 {} + >/dev/null 2>&1 || true
+}
+
 install_default_template() {
     mkdir -p /usr/share/nginx/html
     cat > /usr/share/nginx/html/index.html <<EOF_DEFAULT_HTML
@@ -187,6 +219,7 @@ install_default_template() {
 </html>
 EOF_DEFAULT_HTML
     write_robots_file
+    normalize_web_permissions
     success "已生成默认静态首页"
 }
 
@@ -739,8 +772,10 @@ installTemplate() {
     local tmpdir="/tmp/html_template_extract"
     local staged="/tmp/html_template_staged"
     local extracted_dir=""
+    local nested_archive=""
     local downloaded="false"
     local extracted="false"
+    local script_dir=""
     local url=""
     local -a template_urls=(
         "https://raw.githubusercontent.com/limo13660/v2bx-proxy/main/html_template.zip"
@@ -750,24 +785,38 @@ installTemplate() {
 
     rm -rf "$tmpfile" "$tmpdir" "$staged"
 
-    for url in "${template_urls[@]}"; do
-        rm -rf "$tmpfile" "$tmpdir"
-        info "尝试下载模板资源：$url"
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-        if ! safe_wget "$url" "$tmpfile"; then
-            warn "模板下载失败：$url"
-            continue
-        fi
-
-        downloaded="true"
-
-        if extract_archive "$tmpfile" "$tmpdir"; then
+    if [[ -f "$script_dir/html_template.zip" ]]; then
+        info "优先使用脚本目录内的模板包：$script_dir/html_template.zip"
+        if extract_archive "$script_dir/html_template.zip" "$tmpdir"; then
             extracted="true"
-            break
+        else
+            warn "本地模板包解压失败：$script_dir/html_template.zip"
+            rm -rf "$tmpdir"
         fi
+    fi
 
-        warn "下载内容不是有效的 tar/tar.gz/zip 压缩包：$url"
-    done
+    if [[ "$extracted" != "true" ]]; then
+        for url in "${template_urls[@]}"; do
+            rm -rf "$tmpfile" "$tmpdir"
+            info "尝试下载模板资源：$url"
+
+            if ! safe_wget "$url" "$tmpfile"; then
+                warn "模板下载失败：$url"
+                continue
+            fi
+
+            downloaded="true"
+
+            if extract_archive "$tmpfile" "$tmpdir"; then
+                extracted="true"
+                break
+            fi
+
+            warn "下载内容不是有效的 tar/tar.gz/zip 压缩包：$url"
+        done
+    fi
 
     if [[ "$extracted" != "true" ]]; then
         if [[ "$downloaded" == "true" ]]; then
@@ -780,12 +829,22 @@ installTemplate() {
         return 0
     fi
 
-    extracted_dir="$(find_template_dir "$tmpdir")" || {
+    if ! extracted_dir="$(find_template_dir "$tmpdir")"; then
+        if nested_archive="$(find_template_archive "$tmpdir")"; then
+            info "检测到嵌套模板包，继续解压：$nested_archive"
+            rm -rf "$tmpdir/nested"
+            if extract_archive "$nested_archive" "$tmpdir/nested"; then
+                extracted_dir="$(find_template_dir "$tmpdir/nested")" || true
+            fi
+        fi
+    fi
+
+    if [[ -z "$extracted_dir" ]]; then
         warn "压缩包内未找到可用网页目录；改为生成默认静态首页"
         rm -rf "$tmpfile" "$tmpdir" "$staged"
         install_default_template
         return 0
-    }
+    fi
 
     mkdir -p "$staged"
     cp -a "$extracted_dir"/. "$staged"/ || {
@@ -794,6 +853,13 @@ installTemplate() {
         install_default_template
         return 0
     }
+
+    if ! template_has_index "$staged"; then
+        warn "模板目录缺少 index.html/index.htm，改为生成默认静态首页"
+        rm -rf "$tmpfile" "$tmpdir" "$staged"
+        install_default_template
+        return 0
+    fi
 
     if [[ -d /usr/share/nginx/html && ! -d /usr/share/nginx/html_bak ]]; then
         cp -a /usr/share/nginx/html /usr/share/nginx/html_bak >/dev/null 2>&1 || true
@@ -815,7 +881,15 @@ installTemplate() {
         return 0
     }
 
+    if ! template_has_index /usr/share/nginx/html; then
+        warn "网页模板已落盘，但首页文件缺失；改为生成默认静态首页"
+        rm -rf "$tmpfile" "$tmpdir"
+        install_default_template
+        return 0
+    fi
+
     write_robots_file
+    normalize_web_permissions
     success "网页模板安装完成"
     rm -rf "$tmpfile" "$tmpdir" "$staged"
 }
