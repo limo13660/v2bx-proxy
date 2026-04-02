@@ -72,6 +72,42 @@ command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
+validate_script_file() {
+    local file="$1"
+
+    [[ -s "$file" ]] || return 1
+    grep -q '^#!/usr/bin/env bash' "$file" 2>/dev/null || return 1
+    bash -n "$file" >/dev/null 2>&1 || return 1
+}
+
+download_latest_script_to_file() {
+    local outfile="$1"
+    local url=""
+    local -a update_urls=(
+        "https://raw.githubusercontent.com/limo13660/v2bx-proxy/main/pr.sh"
+        "https://raw.githubusercontent.com/limo13660/v2bx-proxy/master/pr.sh"
+    )
+
+    rm -f "$outfile"
+
+    for url in "${update_urls[@]}"; do
+        info "尝试下载脚本：$url"
+        if ! safe_wget "$url" "$outfile"; then
+            warn "下载失败：$url"
+            continue
+        fi
+
+        if validate_script_file "$outfile"; then
+            return 0
+        fi
+
+        warn "下载内容不是有效脚本：$url"
+        rm -f "$outfile"
+    done
+
+    return 1
+}
+
 install_shortcut_from_file() {
     local source_file="$1"
 
@@ -103,10 +139,37 @@ update_current_script_copy() {
 
 install_shortcut_command() {
     local script_source="${BASH_SOURCE[0]:-$0}"
+    local tmpfile=""
 
     if [[ "$script_source" == "$SHORTCUT_PATH" ]]; then
         return 0
     fi
+
+    case "$script_source" in
+        /dev/fd/*|/proc/*|"")
+            tmpfile="/tmp/${SHORTCUT_CMD}.install.$$"
+            download_latest_script_to_file "$tmpfile" || {
+                warn "当前通过临时输入流运行脚本，且未能从项目仓库下载完整脚本，跳过快捷命令安装"
+                rm -f "$tmpfile"
+                return 1
+            }
+
+            if [[ -f "$SHORTCUT_PATH" ]] && cmp -s "$tmpfile" "$SHORTCUT_PATH" 2>/dev/null; then
+                rm -f "$tmpfile"
+                return 0
+            fi
+
+            install_shortcut_from_file "$tmpfile" || {
+                warn "快捷命令安装失败：无法写入 ${SHORTCUT_PATH}"
+                rm -f "$tmpfile"
+                return 1
+            }
+
+            rm -f "$tmpfile"
+            success "已安装快捷命令：${SHORTCUT_CMD}"
+            return 0
+            ;;
+    esac
 
     if [[ ! -r "$script_source" ]]; then
         warn "未能读取当前脚本内容，跳过快捷命令安装"
@@ -131,56 +194,15 @@ update_script() {
     info "开始更新脚本..."
 
     local tmpfile="/tmp/${SHORTCUT_CMD}.update.$$"
-    local downloaded="false"
-    local updated="false"
-    local url=""
-    local -a update_urls=(
-        "https://raw.githubusercontent.com/limo13660/v2bx-proxy/main/pr.sh"
-        "https://raw.githubusercontent.com/limo13660/v2bx-proxy/master/pr.sh"
-    )
+    download_latest_script_to_file "$tmpfile" || die "脚本更新失败：无法从项目地址下载有效更新，请检查网络或仓库地址"
+
+    install_shortcut_from_file "$tmpfile" || die "更新失败：无法写入 ${SHORTCUT_PATH}"
+    update_current_script_copy "$tmpfile" || true
+    success "脚本更新完成，可直接运行：${SHORTCUT_CMD}"
+    info "项目地址：${PROJECT_REPO_URL}"
 
     rm -f "$tmpfile"
-
-    for url in "${update_urls[@]}"; do
-        info "尝试下载更新：$url"
-        if ! safe_wget "$url" "$tmpfile"; then
-            warn "下载失败：$url"
-            continue
-        fi
-
-        downloaded="true"
-
-        grep -q '^#!/usr/bin/env bash' "$tmpfile" 2>/dev/null || {
-            warn "下载内容不是有效脚本：$url"
-            rm -f "$tmpfile"
-            continue
-        }
-
-        bash -n "$tmpfile" >/dev/null 2>&1 || {
-            warn "下载到的脚本语法校验失败：$url"
-            rm -f "$tmpfile"
-            continue
-        }
-
-        install_shortcut_from_file "$tmpfile" || die "更新失败：无法写入 ${SHORTCUT_PATH}"
-        update_current_script_copy "$tmpfile" || true
-        success "脚本更新完成，可直接运行：${SHORTCUT_CMD}"
-        info "项目地址：${PROJECT_REPO_URL}"
-        updated="true"
-        break
-    done
-
-    rm -f "$tmpfile"
-
-    if [[ "$updated" == "true" ]]; then
-        return 0
-    fi
-
-    if [[ "$downloaded" == "true" ]]; then
-        die "脚本更新失败：远端文件不可用或格式不正确"
-    fi
-
-    die "脚本更新失败：无法从项目地址下载更新，请检查网络或仓库地址"
+    return 0
 }
 
 fetch_public_ip() {
