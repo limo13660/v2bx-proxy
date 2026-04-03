@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Universal Nginx reverse proxy installer (WS/gRPC + TLS)
+# V2bX Nginx reverse proxy installer (WS/gRPC + TLS)
 # Purpose: merge ws.sh and grpc.sh into one script without changing originals.
 # Scope: reliability, rollback safety, maintainability, and DNS-only cert issuance.
 
@@ -14,7 +14,6 @@ PLAIN='\033[0m'
 
 V2BX_BIN="/usr/local/V2bX/V2bX"
 V2BX_SERVICE="V2bX"
-BACKEND_LABEL="后端服务"
 NGINX_CONF_PATH="/etc/nginx/conf.d/"
 BT="false"
 PMT=""
@@ -455,185 +454,13 @@ checkSystem() {
 }
 
 checkV2bX() {
-    return 0
-}
-
-restartV2bX() {
+    if [[ -x "$V2BX_BIN" ]]; then
+        return 0
+    fi
     if systemctl list-unit-files | grep -q '^V2bX\.service'; then
-        systemctl restart "$V2BX_SERVICE" || return 1
         return 0
     fi
-    return 1
-}
-
-statusV2bX() {
-    if systemctl list-unit-files | grep -q '^V2bX\.service'; then
-        systemctl is-active --quiet "$V2BX_SERVICE"
-        return $?
-    fi
-    return 2
-}
-
-find_backend_config() {
-    local candidate=""
-    local exec_line=""
-    local token=""
-    local -a candidates=(
-        "/etc/V2bX/config.json"
-        "/usr/local/V2bX/config.json"
-        "/usr/local/V2bX/bin/config.json"
-    )
-
-    for candidate in "${candidates[@]}"; do
-        [[ -f "$candidate" ]] && {
-            echo "$candidate"
-            return 0
-        }
-    done
-
-    exec_line="$(systemctl cat "$V2BX_SERVICE" 2>/dev/null | awk -F= '/^ExecStart=/{print $2; exit}')"
-    for token in $exec_line; do
-        case "$token" in
-            *.json|*.yaml|*.yml)
-                [[ -f "$token" ]] && {
-                    echo "$token"
-                    return 0
-                }
-                ;;
-        esac
-    done
-
-    return 1
-}
-
-show_backend_restart_hint() {
-    warn "未检测到可自动重启的 V2bX 服务，请手动重启你的后端服务并确认其监听端口为 ${V2PORT}"
-}
-
-show_backend_status_hint() {
-    info "未检测到可自动查询的 V2bX 服务状态，请手动确认你的后端服务正在监听 ${V2PORT}"
-}
-
-status_backend_service() {
-    statusV2bX
-    return $?
-}
-
-restart_backend_service() {
-    restartV2bX
-    return $?
-}
-
-find_v2bx_config() {
-    find_backend_config
-}
-
-extract_listen_ips_from_config() {
-    local conf="$1"
-
-    awk '
-        match($0, /"ListenIP"[[:space:]]*:[[:space:]]*"([^"]+)"/, m) {
-            print m[1]
-        }
-    ' "$conf" 2>/dev/null
-}
-
-show_listenip_reminder() {
-    local conf=""
-    local listen_ip=""
-    local need_change="false"
-    local found_any="false"
-
-    conf="$(find_backend_config || true)"
-
-    if [[ -z "$conf" ]]; then
-        info "如需彻底避免后端端口直连，请确认后端服务仅监听 127.0.0.1 / ::1。"
-        return 0
-    fi
-
-    while IFS= read -r listen_ip; do
-        [[ -n "$listen_ip" ]] || continue
-        found_any="true"
-        case "$listen_ip" in
-            127.0.0.1|::1)
-                ;;
-            *)
-                need_change="true"
-                ;;
-        esac
-    done < <(extract_listen_ips_from_config "$conf")
-
-    if [[ "$found_any" != "true" ]]; then
-        info "请检查 ${conf} 里的 ListenIP，建议改成 127.0.0.1 后重启后端服务。"
-        return 0
-    fi
-
-    if [[ "$need_change" == "true" ]]; then
-        warn "检测到后端配置中的 ListenIP 仍非本地地址，请把 ${conf} 里的 ListenIP 改成 127.0.0.1 后重启后端服务。"
-    else
-        success "后端配置中的 ListenIP 已为本地地址"
-    fi
-}
-
-detect_listenip_status() {
-    echo ""
-    info "开始检测后端 ListenIP 与回源端口监听状态..."
-
-    local conf=""
-    local listen_ip=""
-    local idx=1
-    local found_any="false"
-    local domain=""
-    local backend_port=""
-    local listen_addresses=""
-    local conf_path=""
-
-    conf="$(find_backend_config || true)"
-    if [[ -n "$conf" ]]; then
-        info "后端配置文件：$conf"
-        while IFS= read -r listen_ip; do
-            [[ -n "$listen_ip" ]] || continue
-            found_any="true"
-            case "$listen_ip" in
-                127.0.0.1|::1)
-                    success "Node ${idx} ListenIP: ${listen_ip}"
-                    ;;
-                *)
-                    warn "Node ${idx} ListenIP: ${listen_ip}，建议改成 127.0.0.1"
-                    ;;
-            esac
-            idx=$((idx + 1))
-        done < <(extract_listen_ips_from_config "$conf")
-
-        [[ "$found_any" == "true" ]] || warn "未能从配置文件中解析到 ListenIP 字段"
-    else
-        warn "未定位到后端配置文件，请手动检查监听地址是否为 127.0.0.1 / ::1"
-    fi
-
-    echo ""
-    info "检测本脚本已创建反代的后端端口监听情况："
-    local found_site="false"
-    while IFS= read -r conf_path; do
-        [[ -n "$conf_path" ]] || continue
-        backend_port="$(extract_backend_port_from_conf "$conf_path" || true)"
-        [[ -n "$backend_port" ]] || continue
-
-        found_site="true"
-        domain="$(basename "$conf_path" .conf)"
-        listen_addresses="$(get_port_listen_addresses "$backend_port" | tr '\n' ',' | sed 's/,$//')"
-        [[ -n "$listen_addresses" ]] || listen_addresses="未检测到监听"
-
-        if backendListensPublicly "$backend_port"; then
-            warn "${domain}: 后端端口 ${backend_port} 正在公网地址监听 [${listen_addresses}]"
-        else
-            success "${domain}: 后端端口 ${backend_port} 仅本地监听 [${listen_addresses}]"
-        fi
-    done < <(list_site_confs)
-
-    [[ "$found_site" == "true" ]] || info "未检测到由本脚本创建的反代配置"
-
-    echo ""
-    show_listenip_reminder
+    die "未检测到 V2bX，请先安装 V2bX 再运行此脚本"
 }
 
 restartV2bX() {
@@ -644,6 +471,14 @@ restartV2bX() {
     if command_exists service; then
         service "$V2BX_SERVICE" restart || return 1
         return 0
+    fi
+    return 1
+}
+
+statusV2bX() {
+    if systemctl list-unit-files | grep -q '^V2bX\.service'; then
+        systemctl is-active --quiet "$V2BX_SERVICE"
+        return $?
     fi
     return 1
 }
@@ -731,7 +566,7 @@ getData() {
     echo " 运行之前请确认如下条件已经具备："
     colorEcho "$YELLOW" "  1. 一个伪装域名 DNS 解析指向当前服务器 IP（${IP:-未检测到公网IP}）"
     colorEcho "$BLUE"   "  2. 证书将使用 Cloudflare DNS 模式申请，请提前准备可编辑 DNS 的 API Token"
-    colorEcho "$BLUE"   "  3. 面板 / 后端节点传输协议需要与本脚本中选择的模式保持一致，客户端外显地址请使用域名而非服务器 IP"
+    colorEcho "$BLUE"   "  3. 面板 / V2bX 节点传输协议需要与本脚本中选择的模式保持一致，客户端外显地址请使用域名而非服务器 IP"
     colorEcho "$BLUE"   "  4. 后端服务端口仅供本机 / Nginx 回源使用，不应暴露到公网"
     colorEcho "$BLUE"   "  5. 若想尽量贴近正常流量，建议上游节点协议选 Trojan，传输选 gRPC，端口优先 443，并给域名准备一个真网站首页"
     echo ""
@@ -943,12 +778,7 @@ configNginx() {
     if [[ "$MODE" == "ws" ]]; then
         transport_block="location ${WSPATH} {
         proxy_redirect off;
-        proxy_connect_timeout 30s;
         proxy_read_timeout 1200s;
-        proxy_send_timeout 1200s;
-        proxy_buffering off;
-        proxy_request_buffering off;
-        proxy_socket_keepalive on;
         proxy_pass http://127.0.0.1:${V2PORT};
         proxy_http_version 1.1;
         proxy_set_header Upgrade \$http_upgrade;
@@ -956,9 +786,6 @@ configNginx() {
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto https;
-        proxy_set_header X-Forwarded-Host \$host;
-        proxy_cache_bypass \$http_upgrade;
     }"
     else
         transport_block="location ^~ /${GRPC_SERVICE}/Tun {
@@ -1431,6 +1258,147 @@ cleanup_backend_firewall_rules() {
     return 1
 }
 
+find_v2bx_config() {
+    local candidate=""
+    local exec_line=""
+    local token=""
+    local -a candidates=(
+        "/etc/V2bX/config.json"
+        "/usr/local/V2bX/config.json"
+        "/usr/local/V2bX/bin/config.json"
+    )
+
+    for candidate in "${candidates[@]}"; do
+        [[ -f "$candidate" ]] && {
+            echo "$candidate"
+            return 0
+        }
+    done
+
+    exec_line="$(systemctl cat "$V2BX_SERVICE" 2>/dev/null | awk -F= '/^ExecStart=/{print $2; exit}')"
+    for token in $exec_line; do
+        case "$token" in
+            *.json|*.yaml|*.yml)
+                [[ -f "$token" ]] && {
+                    echo "$token"
+                    return 0
+                }
+                ;;
+        esac
+    done
+
+    return 1
+}
+
+extract_listen_ips_from_config() {
+    local conf="$1"
+
+    awk '
+        match($0, /"ListenIP"[[:space:]]*:[[:space:]]*"([^"]+)"/, m) {
+            print m[1]
+        }
+    ' "$conf" 2>/dev/null
+}
+
+show_listenip_reminder() {
+    local conf=""
+    local listen_ip=""
+    local need_change="false"
+    local found_any="false"
+
+    conf="$(find_v2bx_config || true)"
+
+    if [[ -z "$conf" ]]; then
+        info "如需彻底避免后端端口直连，请把 V2bX 配置里的 ListenIP 改成 127.0.0.1，然后重启 V2bX。"
+        return 0
+    fi
+
+    while IFS= read -r listen_ip; do
+        [[ -n "$listen_ip" ]] || continue
+        found_any="true"
+        case "$listen_ip" in
+            127.0.0.1|::1)
+                ;;
+            *)
+                need_change="true"
+                ;;
+        esac
+    done < <(extract_listen_ips_from_config "$conf")
+
+    if [[ "$found_any" != "true" ]]; then
+        info "请检查 ${conf} 里的 ListenIP，建议改成 127.0.0.1 后重启 V2bX。"
+        return 0
+    fi
+
+    if [[ "$need_change" == "true" ]]; then
+        warn "检测到 V2bX 配置中的 ListenIP 仍非本地地址，请把 ${conf} 里的 ListenIP 改成 127.0.0.1 后重启 V2bX。"
+    else
+        success "V2bX 配置中的 ListenIP 已为本地地址"
+    fi
+}
+
+detect_listenip_status() {
+    checkV2bX
+
+    echo ""
+    info "开始检测 V2bX ListenIP 与后端端口监听状态..."
+
+    local conf=""
+    local listen_ip=""
+    local idx=1
+    local found_any="false"
+    local domain=""
+    local backend_port=""
+    local listen_addresses=""
+    local conf_path=""
+
+    conf="$(find_v2bx_config || true)"
+    if [[ -n "$conf" ]]; then
+        info "V2bX 配置文件：$conf"
+        while IFS= read -r listen_ip; do
+            [[ -n "$listen_ip" ]] || continue
+            found_any="true"
+            case "$listen_ip" in
+                127.0.0.1|::1)
+                    success "Node ${idx} ListenIP: ${listen_ip}"
+                    ;;
+                *)
+                    warn "Node ${idx} ListenIP: ${listen_ip}，建议改成 127.0.0.1"
+                    ;;
+            esac
+            idx=$((idx + 1))
+        done < <(extract_listen_ips_from_config "$conf")
+
+        [[ "$found_any" == "true" ]] || warn "未能从配置文件中解析到 ListenIP 字段"
+    else
+        warn "未定位到 V2bX 配置文件，请手动检查 ListenIP 是否为 127.0.0.1"
+    fi
+
+    echo ""
+    info "检测本脚本已创建反代的后端端口监听情况："
+    local found_site="false"
+    while IFS= read -r conf_path; do
+        [[ -n "$conf_path" ]] || continue
+        backend_port="$(extract_backend_port_from_conf "$conf_path" || true)"
+        [[ -n "$backend_port" ]] || continue
+
+        found_site="true"
+        domain="$(basename "$conf_path" .conf)"
+        listen_addresses="$(get_port_listen_addresses "$backend_port" | tr '\n' ',' | sed 's/,$//')"
+        [[ -n "$listen_addresses" ]] || listen_addresses="未检测到监听"
+
+        if backendListensPublicly "$backend_port"; then
+            warn "${domain}: 后端端口 ${backend_port} 正在公网地址监听 [${listen_addresses}]"
+        else
+            success "${domain}: 后端端口 ${backend_port} 仅本地监听 [${listen_addresses}]"
+        fi
+    done < <(list_site_confs)
+
+    [[ "$found_site" == "true" ]] || info "未检测到由本脚本创建的反代配置"
+
+    echo ""
+    show_listenip_reminder
+}
 
 installBBR() {
     if [[ "$NEED_BBR" != "y" ]]; then
@@ -1465,7 +1433,7 @@ installBBR() {
 
 showSummary() {
     echo ""
-    success "安装完成，后端回源端口为 ${V2PORT}，用户连接端口为 ${PORT}!"
+    success "安装完成，V2bX 内部回源端口为 ${V2PORT}，用户连接端口为 ${PORT}!"
     success "----------- 关键参数 -----------------------------"
     colorEcho "$RED"   " 推荐栈：${STACK_HINT}"
     colorEcho "$RED"   " 服务/后端监听端口(仅本机回源)：${V2PORT}"
@@ -1541,17 +1509,13 @@ postCheck() {
     fi
 
     if ! statusV2bX; then
-        if [[ $? -eq 1 ]]; then
-            warn "V2bX 当前未处于运行状态，请检查：systemctl status V2bX"
-            ok="false"
-        else
-            show_backend_status_hint
-        fi
+        warn "V2bX 当前未处于运行状态，请检查：systemctl status V2bX"
+        ok="false"
     fi
 
     if backendListensPublicly; then
         warn "检测到后端端口 ${V2PORT} 正在非本地地址监听"
-        warn "脚本已尝试通过防火墙阻断公网直连，但仍建议把后端服务改为仅监听 127.0.0.1 / ::1"
+        warn "脚本已尝试通过防火墙阻断公网直连，但仍建议把 V2bX 改为仅监听 127.0.0.1 / ::1"
     fi
 
     [[ "$ok" == "true" ]]
@@ -1599,6 +1563,7 @@ pick_site_conf() {
 }
 
 install_proxy() {
+    checkV2bX
     getData
 
     if [[ "$PMT" == "apt" ]]; then
@@ -1628,15 +1593,15 @@ install_proxy() {
         startNginx || die "Nginx 启动失败"
     fi
 
-    if restart_backend_service; then
+    if restartV2bX; then
         sleep 2
-        if status_backend_service; then
+        if statusV2bX; then
             success "V2bX 重启成功"
         else
             warn "V2bX 已尝试重启，但当前状态未确认，请用 systemctl status V2bX 检查"
         fi
     else
-        show_backend_restart_hint
+        warn "V2bX 重启失败，请手动执行 systemctl restart V2bX"
     fi
 
     showSummary
@@ -1704,14 +1669,10 @@ uninstall_proxy() {
 
 show_status() {
     echo ""
-    if status_backend_service; then
+    if statusV2bX; then
         success "V2bX: 运行中"
     else
-        if [[ $? -eq 1 ]]; then
-            warn "V2bX: 未运行"
-        else
-            info "后端服务: 未检测到可自动查询状态的 V2bX 服务"
-        fi
+        warn "V2bX: 未运行或未检测到"
     fi
 
     if nginx_is_active; then
@@ -1726,10 +1687,10 @@ show_status() {
 menu() {
     clear
     echo "================================"
-    echo "     通用 Nginx 一键添加反代     "
+    echo "     V2bX 一键添加 Nginx 反代     "
     echo "================================"
     echo ""
-    echo -e "  ${GREEN}1.${PLAIN}   添加 Nginx 反代(WS/gRPC + TLS)"
+    echo -e "  ${GREEN}1.${PLAIN}   为 V2bX 添加 Nginx 反代(WS/gRPC + TLS)"
     echo -e "  ${GREEN}2.${PLAIN}   检测并删除某个域名的反代配置"
     echo -e "  ${GREEN}3.${PLAIN}   查看当前服务状态"
     echo -e "  ${GREEN}4.${PLAIN}   检测 ListenIP 与后端端口暴露"
