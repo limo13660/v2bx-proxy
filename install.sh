@@ -96,7 +96,7 @@ main() {
         "https://raw.githubusercontent.com/limo13660/v2bx-proxy/master/v2pr.sh"
     )
 
-    trap 'rm -f "$tmpfile"' EXIT
+    trap 'rm -f "/tmp/${SHORTCUT_CMD}.install.$$"' EXIT
 
     for url in "${update_urls[@]}"; do
         info "尝试下载脚本：$url"
