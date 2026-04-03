@@ -482,7 +482,7 @@ choose_mode() {
     echo ""
     info "请选择反代协议："
     echo -e "  ${GREEN}1.${PLAIN} WS + TLS"
-    echo -e "  ${GREEN}2.${PLAIN} gRPC + TLS  ${YELLOW}(推荐，更适合 ${STACK_HINT})${PLAIN}"
+    echo -e "  ${GREEN}2.${PLAIN} gRPC + TLS"
 
     local answer
     read -r -p "请输入选项 [1-2，默认2]：" answer
