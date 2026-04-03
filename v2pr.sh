@@ -31,6 +31,7 @@ STACK_HINT="gRPC + TLS + Nginx + 真网站"
 CERT_FILE=""
 KEY_FILE=""
 REMOTE_HOST=""
+REMOTE_SNI=""
 PROXY_URL=""
 ALLOW_SPIDER="n"
 NEED_BBR="n"
@@ -565,6 +566,9 @@ getData() {
     [[ "${PORT:0:1}" != "0" ]] || die "端口不能以 0 开头"
     check_frontend_port
     info "Nginx 端口：$PORT"
+    if [[ "$PORT" != "443" ]]; then
+        warn "若计划套 Cloudflare CDN，建议外部监听端口优先使用 443；非 443 端口更适合直连场景。"
+    fi
 
     read -r -p " 请输入服务端口(后端监听端口，仅供本机/Nginx回源，不对公网开放)[10000-65535，默认随机]：" V2PORT
     [[ -z "$V2PORT" ]] && V2PORT="$(shuf -i 10000-65000 -n 1)"
@@ -596,6 +600,7 @@ getData() {
             ;;
     esac
     REMOTE_HOST="$(echo "$PROXY_URL" | cut -d/ -f3)"
+    REMOTE_SNI="${REMOTE_HOST%%:*}"
     info "伪装网站：${PROXY_URL:-本地静态模板}"
 
     echo ""
@@ -717,22 +722,37 @@ configNginx() {
 
     local tmp_conf="${SITE_CONF}.tmp"
     local bak_conf="${SITE_CONF}.bak"
+    local redirect_target=""
     local site_block=""
     local transport_block=""
+
+    if [[ "$PORT" == "443" ]]; then
+        redirect_target='https://$server_name$request_uri'
+    else
+        redirect_target="https://\$server_name:${PORT}\$request_uri"
+    fi
 
     if [[ -n "$PROXY_URL" ]]; then
         site_block="location / {
         proxy_ssl_server_name on;
+        proxy_ssl_name $REMOTE_SNI;
         proxy_http_version 1.1;
+        proxy_connect_timeout 10s;
+        proxy_send_timeout 120s;
+        proxy_read_timeout 120s;
+        proxy_next_upstream error timeout invalid_header http_500 http_502 http_503 http_504;
         proxy_pass $PROXY_URL;
         proxy_set_header Host $REMOTE_HOST;
+        proxy_set_header Connection \"\";
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Proto \$scheme;
         proxy_set_header X-Forwarded-Host \$host;
+        proxy_set_header X-Forwarded-Port \$server_port;
         proxy_set_header Accept-Encoding '';
         sub_filter \"$REMOTE_HOST\" \"$DOMAIN\";
         sub_filter_once off;
+        sub_filter_types text/html text/css application/javascript application/json application/xml;
     }"
     else
         site_block="location / {
@@ -741,11 +761,13 @@ configNginx() {
     fi
 
     if [[ "$MODE" == "ws" ]]; then
-        transport_block="location ${WSPATH} {
+        transport_block="location = ${WSPATH} {
+        if (\$request_method != GET) { return 404; }
+        if (\$http_upgrade !~* websocket) { return 404; }
         proxy_redirect off;
         proxy_connect_timeout 30s;
-        proxy_read_timeout 1200s;
-        proxy_send_timeout 1200s;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
         proxy_buffering off;
         proxy_request_buffering off;
         proxy_socket_keepalive on;
@@ -756,27 +778,40 @@ configNginx() {
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Proto \$scheme;
         proxy_set_header X-Forwarded-Host \$host;
+        proxy_set_header X-Forwarded-Port \$server_port;
         proxy_cache_bypass \$http_upgrade;
     }"
     else
-        transport_block="location ^~ /${GRPC_SERVICE}/Tun {
+        transport_block="location = /${GRPC_SERVICE}/Tun {
+        if (\$request_method != POST) { return 404; }
+        if (\$content_type !~ ^application/grpc) { return 404; }
         grpc_set_header X-Real-IP \$remote_addr;
         grpc_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        grpc_set_header X-Forwarded-Proto \$scheme;
+        grpc_set_header X-Forwarded-Host \$host;
+        grpc_set_header X-Forwarded-Port \$server_port;
         grpc_set_header Host \$host;
-        grpc_read_timeout 1200s;
-        grpc_send_timeout 1200s;
+        grpc_set_header TE trailers;
+        grpc_read_timeout 3600s;
+        grpc_send_timeout 3600s;
         grpc_socket_keepalive on;
         grpc_pass grpc://127.0.0.1:${V2PORT};
     }
 
-    location ^~ /${GRPC_SERVICE}/TunMulti {
+    location = /${GRPC_SERVICE}/TunMulti {
+        if (\$request_method != POST) { return 404; }
+        if (\$content_type !~ ^application/grpc) { return 404; }
         grpc_set_header X-Real-IP \$remote_addr;
         grpc_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        grpc_set_header X-Forwarded-Proto \$scheme;
+        grpc_set_header X-Forwarded-Host \$host;
+        grpc_set_header X-Forwarded-Port \$server_port;
         grpc_set_header Host \$host;
-        grpc_read_timeout 1200s;
-        grpc_send_timeout 1200s;
+        grpc_set_header TE trailers;
+        grpc_read_timeout 3600s;
+        grpc_send_timeout 3600s;
         grpc_socket_keepalive on;
         grpc_pass grpc://127.0.0.1:${V2PORT};
     }"
@@ -791,7 +826,7 @@ server {
     listen 80;
     listen [::]:80;
     server_name ${DOMAIN};
-    return 301 https://\$server_name:${PORT}\$request_uri;
+    return 301 ${redirect_target};
 }
 
 server {
@@ -805,14 +840,22 @@ server {
     ssl_ciphers HIGH:!aNULL:!MD5;
     ssl_prefer_server_ciphers on;
     ssl_ecdh_curve X25519:prime256v1;
-    ssl_session_cache shared:SSL:10m;
-    ssl_session_timeout 10m;
+    ssl_session_cache shared:SSL:20m;
+    ssl_session_timeout 1d;
     ssl_session_tickets off;
+    ssl_buffer_size 4k;
     ssl_certificate ${CERT_FILE};
     ssl_certificate_key ${KEY_FILE};
     ssl_stapling on;
     ssl_stapling_verify on;
     add_header Strict-Transport-Security "max-age=31536000" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    keepalive_timeout 70s;
+    keepalive_requests 1000;
+    client_header_timeout 15s;
+    client_body_timeout 60s;
+    send_timeout 60s;
 
     root /usr/share/nginx/html;
     index index.html;
@@ -1019,10 +1062,12 @@ showSummary() {
     info "请确认你的后端服务已监听 127.0.0.1:${V2PORT}，且传输参数与上面示例一致。"
     if [[ "$MODE" == "ws" ]]; then
         info "请将后端的 WS 参数设置为 network=ws、security=tls、path=${WSPATH}、host=${DOMAIN}。"
+        info "若要套 Cloudflare CDN，建议让客户端或后端保持 30-60 秒内有心跳/数据帧，减少空闲连接被提前关闭的概率。"
         info "客户端外显地址请使用 ${DOMAIN}:${PORT}，不要把 ${V2PORT} 直接暴露给客户端。"
     else
         info "请将后端的 gRPC 参数设置为 network=grpc、security=tls、serviceName=${GRPC_SERVICE}。"
         info "gRPC 由 Nginx 终止 TLS 后转发到 127.0.0.1:${V2PORT}，后端无需再次套 TLS。"
+        info "若要套 Cloudflare CDN，建议外部监听端口使用 443，并在后端启用 30-60 秒级别的 gRPC keepalive。"
         info "客户端外显地址请使用 ${DOMAIN}:${PORT}，不要把 ${V2PORT} 直接暴露给客户端。"
     fi
 }
