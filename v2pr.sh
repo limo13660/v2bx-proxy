@@ -38,9 +38,6 @@ INSTALL_BBR="false"
 SITE_CONF=""
 ROBOT_CONFIG=""
 DEFAULT_PROXY_URL="https://bing.ioliu.cn"
-BACKEND_LOCK_RESULT="未设置"
-FIREWALL_TOOL=""
-FIREWALL_POLICY_RESULT="未设置"
 SHORTCUT_CMD="v2pr"
 SHORTCUT_PATH="/usr/local/bin/${SHORTCUT_CMD}"
 PROJECT_REPO_URL="https://github.com/limo13660/v2bx-proxy"
@@ -535,7 +532,7 @@ getData() {
     colorEcho "$YELLOW" "  1. 一个伪装域名 DNS 解析指向当前服务器 IP（${IP:-未检测到公网IP}）"
     colorEcho "$BLUE"   "  2. 证书将使用 Cloudflare DNS 模式申请，请提前准备可编辑 DNS 的 API Token"
     colorEcho "$BLUE"   "  3. 你的后端服务传输协议需要与本脚本中选择的模式保持一致，客户端外显地址请使用域名而非服务器 IP"
-    colorEcho "$BLUE"   "  4. 后端服务端口仅供本机 / Nginx 回源使用，不应暴露到公网"
+    colorEcho "$BLUE"   "  4. 后端服务端口仅供本机 / Nginx 回源使用，建议你自行控制访问范围"
     colorEcho "$BLUE"   "  5. 若想尽量贴近正常流量，走 Cloudflare CDN 时建议优先 443，并给域名准备一个真网站首页"
     echo ""
     read -r -p " 确认满足按 y，按其他退出脚本：" answer
@@ -576,7 +573,7 @@ getData() {
     [[ "${V2PORT:0:1}" != "0" ]] || die "端口不能以 0 开头"
     check_backend_port
     info "后端服务端口：$V2PORT"
-    info "该端口仅供本机 / Nginx 回源使用，脚本会尝试自动拒绝公网直连"
+    info "该端口仅供本机 / Nginx 回源使用"
 
     collect_transport_data
 
@@ -943,298 +940,6 @@ installTemplate() {
     rm -rf "$tmpfile" "$tmpdir" "$staged"
 }
 
-ensureFirewallTool() {
-    if [[ "$PMT" == "apt" ]]; then
-        if command_exists ufw; then
-            FIREWALL_TOOL="ufw"
-            return 0
-        fi
-        if command_exists firewall-cmd; then
-            FIREWALL_TOOL="firewalld"
-            return 0
-        fi
-    else
-        if command_exists firewall-cmd; then
-            FIREWALL_TOOL="firewalld"
-            return 0
-        fi
-        if command_exists ufw; then
-            FIREWALL_TOOL="ufw"
-            return 0
-        fi
-    fi
-
-    echo ""
-    if [[ "$PMT" == "apt" ]]; then
-        info "未检测到可用防火墙工具，开始自动安装 ufw..."
-        if $CMD_INSTALL ufw; then
-            command_exists ufw || die "ufw 安装后未检测到命令"
-            FIREWALL_TOOL="ufw"
-            success "已自动安装防火墙工具：ufw"
-            return 0
-        fi
-    else
-        info "未检测到可用防火墙工具，开始自动安装 firewalld..."
-        if $CMD_INSTALL firewalld; then
-            command_exists firewall-cmd || die "firewalld 安装后未检测到命令"
-            FIREWALL_TOOL="firewalld"
-            success "已自动安装防火墙工具：firewalld"
-            return 0
-        fi
-    fi
-
-    if command_exists iptables; then
-        FIREWALL_TOOL="iptables"
-        warn "自动安装防火墙工具失败，回退为 iptables 兼容模式"
-        return 0
-    fi
-
-    die "未能准备可用的防火墙工具，无法继续保护后端端口"
-}
-
-getFirewalldZone() {
-    local zone=""
-    zone="$(firewall-cmd --get-default-zone 2>/dev/null || true)"
-    echo "${zone:-public}"
-}
-
-configureFirewalldDefaultAllow() {
-    local zone=""
-
-    systemctl enable firewalld >/dev/null 2>&1 || true
-    systemctl start firewalld >/dev/null 2>&1 || die "firewalld 启动失败"
-
-    zone="$(getFirewalldZone)"
-    firewall-cmd --permanent --zone="$zone" --set-target=ACCEPT >/dev/null 2>&1 || die "firewalld 默认放行设置失败"
-    firewall-cmd --reload >/dev/null 2>&1 || die "firewalld 重载失败"
-
-    FIREWALL_POLICY_RESULT="firewalld 已启用，默认放行入站/出站流量，仅额外锁定后端端口"
-    success "已启用 firewalld，并设置默认放行流量"
-}
-
-configureUfwDefaultAllow() {
-    ufw default allow incoming >/dev/null 2>&1 || die "ufw 默认入站放行设置失败"
-    ufw default allow outgoing >/dev/null 2>&1 || die "ufw 默认出站放行设置失败"
-    ufw --force enable >/dev/null 2>&1 || die "ufw 启用失败"
-
-    FIREWALL_POLICY_RESULT="ufw 已启用，默认放行入站/出站流量，仅额外锁定后端端口"
-    success "已启用 ufw，并设置默认放行流量"
-}
-
-configureIptablesCompatibility() {
-    iptables -C INPUT -p tcp --dport 80 -j ACCEPT >/dev/null 2>&1 || iptables -I INPUT -p tcp --dport 80 -j ACCEPT
-    iptables -C INPUT -p tcp --dport 443 -j ACCEPT >/dev/null 2>&1 || iptables -I INPUT -p tcp --dport 443 -j ACCEPT
-    if [[ "$PORT" != "443" ]]; then
-        iptables -C INPUT -p tcp --dport "$PORT" -j ACCEPT >/dev/null 2>&1 || iptables -I INPUT -p tcp --dport "$PORT" -j ACCEPT
-    fi
-
-    FIREWALL_POLICY_RESULT="使用 iptables 兼容模式：已放行 80/443/前端端口，并继续锁定后端端口"
-    warn "当前回退为 iptables 兼容模式，未统一改动系统默认放行策略"
-}
-
-setFirewall() {
-    ensureFirewallTool
-
-    case "$FIREWALL_TOOL" in
-        firewalld)
-            configureFirewalldDefaultAllow
-            ;;
-        ufw)
-            configureUfwDefaultAllow
-            ;;
-        iptables)
-            configureIptablesCompatibility
-            ;;
-        *)
-            die "未知的防火墙工具：${FIREWALL_TOOL}"
-            ;;
-    esac
-}
-
-backendListensPublicly() {
-    local port="${1:-$V2PORT}"
-    local addr=""
-
-    while IFS= read -r addr; do
-        case "$addr" in
-            127.0.0.1:${port}|[::1]:${port}|::1:${port})
-                ;;
-            *:${port})
-                return 0
-                ;;
-        esac
-    done < <(get_port_listen_addresses "$port")
-
-    return 1
-}
-
-get_port_listen_addresses() {
-    local port="${1:-$V2PORT}"
-
-    if command_exists ss; then
-        ss -lnt 2>/dev/null | awk -v p=":${port}" 'NR>1 && $4 ~ p"$" {print $4}' | sort -u
-        return 0
-    fi
-
-    if command_exists netstat; then
-        netstat -lnt 2>/dev/null | awk -v p=":${port}" 'NR>2 && $4 ~ p"$" {print $4}' | sort -u
-        return 0
-    fi
-
-    return 1
-}
-
-lockBackendPortWithFirewalld() {
-    firewall-cmd --permanent --remove-port="${V2PORT}/tcp" >/dev/null 2>&1 || true
-
-    firewall-cmd --permanent --direct --remove-rule ipv4 filter INPUT 0 -i lo -p tcp --dport "$V2PORT" -j ACCEPT >/dev/null 2>&1 || true
-    firewall-cmd --permanent --direct --remove-rule ipv4 filter INPUT 1 ! -i lo -p tcp --dport "$V2PORT" -j DROP >/dev/null 2>&1 || true
-    firewall-cmd --permanent --direct --add-rule ipv4 filter INPUT 0 -i lo -p tcp --dport "$V2PORT" -j ACCEPT >/dev/null 2>&1 || return 1
-    firewall-cmd --permanent --direct --add-rule ipv4 filter INPUT 1 ! -i lo -p tcp --dport "$V2PORT" -j DROP >/dev/null 2>&1 || return 1
-
-    firewall-cmd --permanent --direct --remove-rule ipv6 filter INPUT 0 -i lo -p tcp --dport "$V2PORT" -j ACCEPT >/dev/null 2>&1 || true
-    firewall-cmd --permanent --direct --remove-rule ipv6 filter INPUT 1 ! -i lo -p tcp --dport "$V2PORT" -j DROP >/dev/null 2>&1 || true
-    firewall-cmd --permanent --direct --add-rule ipv6 filter INPUT 0 -i lo -p tcp --dport "$V2PORT" -j ACCEPT >/dev/null 2>&1 || true
-    firewall-cmd --permanent --direct --add-rule ipv6 filter INPUT 1 ! -i lo -p tcp --dport "$V2PORT" -j DROP >/dev/null 2>&1 || true
-
-    firewall-cmd --reload >/dev/null 2>&1 || return 1
-}
-
-lockBackendPortWithUfw() {
-    ufw --force delete allow in on lo to any port "$V2PORT" proto tcp >/dev/null 2>&1 || true
-    ufw --force delete deny "${V2PORT}/tcp" >/dev/null 2>&1 || true
-
-    ufw insert 1 allow in on lo to any port "$V2PORT" proto tcp >/dev/null 2>&1 || return 1
-    ufw insert 2 deny "${V2PORT}/tcp" >/dev/null 2>&1 || return 1
-}
-
-lockBackendPortWithIptables() {
-    iptables -C INPUT -i lo -p tcp --dport "$V2PORT" -j ACCEPT >/dev/null 2>&1 || iptables -I INPUT 1 -i lo -p tcp --dport "$V2PORT" -j ACCEPT >/dev/null 2>&1 || return 1
-    iptables -C INPUT ! -i lo -p tcp --dport "$V2PORT" -j DROP >/dev/null 2>&1 || iptables -I INPUT 2 ! -i lo -p tcp --dport "$V2PORT" -j DROP >/dev/null 2>&1 || return 1
-
-    if command_exists ip6tables; then
-        ip6tables -C INPUT -i lo -p tcp --dport "$V2PORT" -j ACCEPT >/dev/null 2>&1 || ip6tables -I INPUT 1 -i lo -p tcp --dport "$V2PORT" -j ACCEPT >/dev/null 2>&1 || true
-        ip6tables -C INPUT ! -i lo -p tcp --dport "$V2PORT" -j DROP >/dev/null 2>&1 || ip6tables -I INPUT 2 ! -i lo -p tcp --dport "$V2PORT" -j DROP >/dev/null 2>&1 || true
-    fi
-}
-
-protectBackendPort() {
-    case "$FIREWALL_TOOL" in
-        firewalld)
-            if lockBackendPortWithFirewalld; then
-                BACKEND_LOCK_RESULT="已通过 firewalld 限制仅本机可访问"
-                success "已通过 firewalld 拒绝公网直连后端端口 ${V2PORT}"
-                return 0
-            fi
-            ;;
-        ufw)
-            if lockBackendPortWithUfw; then
-                BACKEND_LOCK_RESULT="已通过 ufw 限制仅本机可访问"
-                success "已通过 ufw 拒绝公网直连后端端口 ${V2PORT}"
-                return 0
-            fi
-            ;;
-        iptables)
-            if lockBackendPortWithIptables; then
-                BACKEND_LOCK_RESULT="已通过 iptables 限制仅本机可访问（重启后请确认规则仍在）"
-                success "已通过 iptables 拒绝公网直连后端端口 ${V2PORT}"
-                return 0
-            fi
-            ;;
-    esac
-
-    BACKEND_LOCK_RESULT="未自动锁定，请手动限制仅 127.0.0.1 / ::1 可访问"
-    warn "已检测到防火墙工具 ${FIREWALL_TOOL:-unknown}，但未能自动锁定后端端口 ${V2PORT}"
-    warn "请手动限制仅 127.0.0.1 / ::1 可访问，避免客户端直连节点 IP"
-    return 1
-}
-
-extract_backend_port_from_conf() {
-    local conf="$1"
-
-    awk '
-        match($0, /127\.0\.0\.1:([0-9]+)/, m) {
-            print m[1]
-            exit
-        }
-    ' "$conf" 2>/dev/null
-}
-
-remove_backend_firewalld_rules() {
-    local port="$1"
-
-    command_exists firewall-cmd || return 1
-    systemctl is-active --quiet firewalld || return 1
-
-    firewall-cmd --permanent --remove-port="${port}/tcp" >/dev/null 2>&1 || true
-    firewall-cmd --permanent --direct --remove-rule ipv4 filter INPUT 0 -i lo -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1 || true
-    firewall-cmd --permanent --direct --remove-rule ipv4 filter INPUT 1 ! -i lo -p tcp --dport "$port" -j DROP >/dev/null 2>&1 || true
-    firewall-cmd --permanent --direct --remove-rule ipv6 filter INPUT 0 -i lo -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1 || true
-    firewall-cmd --permanent --direct --remove-rule ipv6 filter INPUT 1 ! -i lo -p tcp --dport "$port" -j DROP >/dev/null 2>&1 || true
-    firewall-cmd --reload >/dev/null 2>&1 || true
-    return 0
-}
-
-remove_backend_ufw_rules() {
-    local port="$1"
-
-    command_exists ufw || return 1
-
-    ufw --force delete allow in on lo to any port "$port" proto tcp >/dev/null 2>&1 || true
-    ufw --force delete deny "${port}/tcp" >/dev/null 2>&1 || true
-    return 0
-}
-
-remove_backend_iptables_rules() {
-    local port="$1"
-
-    command_exists iptables || return 1
-
-    while iptables -C INPUT -i lo -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1; do
-        iptables -D INPUT -i lo -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1 || break
-    done
-    while iptables -C INPUT ! -i lo -p tcp --dport "$port" -j DROP >/dev/null 2>&1; do
-        iptables -D INPUT ! -i lo -p tcp --dport "$port" -j DROP >/dev/null 2>&1 || break
-    done
-
-    if command_exists ip6tables; then
-        while ip6tables -C INPUT -i lo -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1; do
-            ip6tables -D INPUT -i lo -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1 || break
-        done
-        while ip6tables -C INPUT ! -i lo -p tcp --dport "$port" -j DROP >/dev/null 2>&1; do
-            ip6tables -D INPUT ! -i lo -p tcp --dport "$port" -j DROP >/dev/null 2>&1 || break
-        done
-    fi
-
-    return 0
-}
-
-cleanup_backend_firewall_rules() {
-    local port="$1"
-    local handled="false"
-
-    [[ "$port" =~ ^[0-9]+$ ]] || return 1
-
-    if remove_backend_firewalld_rules "$port"; then
-        handled="true"
-    fi
-    if remove_backend_ufw_rules "$port"; then
-        handled="true"
-    fi
-    if remove_backend_iptables_rules "$port"; then
-        handled="true"
-    fi
-
-    if [[ "$handled" == "true" ]]; then
-        success "已清理后端端口 ${port} 的防火墙规则"
-        return 0
-    fi
-
-    warn "未检测到可清理的防火墙工具，跳过后端端口 ${port} 的规则清理"
-    return 1
-}
-
-
 installBBR() {
     if [[ "$NEED_BBR" != "y" ]]; then
         INSTALL_BBR="false"
@@ -1307,8 +1012,6 @@ showSummary() {
     info "Nginx 配置文件：${SITE_CONF}"
     info "证书文件：${CERT_FILE}"
     info "伪装站点：${PROXY_URL:-/usr/share/nginx/html 本地站点}"
-    info "防火墙策略：${FIREWALL_POLICY_RESULT}"
-    info "后端端口防护：${BACKEND_LOCK_RESULT}"
     if [[ -x "$SHORTCUT_PATH" ]]; then
         info "后续可直接运行命令：${SHORTCUT_CMD}"
         info "更新脚本命令：${SHORTCUT_CMD} update"
@@ -1404,8 +1107,6 @@ install_proxy() {
     command_exists unzip || die "unzip 安装失败，请检查网络"
 
     installNginx
-    setFirewall
-    protectBackendPort || true
     getCert
     installTemplate
     configNginx
@@ -1429,10 +1130,7 @@ uninstall_proxy() {
     }
 
     local conf="$SITE_CONF"
-    local backend_port=""
     [[ -f "$conf" ]] || die "未找到配置文件：$conf"
-
-    backend_port="$(extract_backend_port_from_conf "$conf" || true)"
 
     local cert_pem="/etc/ysbl/${DOMAIN}.pem"
     local cert_key="/etc/ysbl/${DOMAIN}.key"
@@ -1460,12 +1158,6 @@ uninstall_proxy() {
         mv -f "$bak_conf" "$conf"
         nginx_test || true
         die "删除后 Nginx 配置校验失败，已自动回滚"
-    fi
-
-    if [[ -n "$backend_port" ]]; then
-        cleanup_backend_firewall_rules "$backend_port" || true
-    else
-        warn "未能从配置中识别后端端口，已跳过防火墙规则清理"
     fi
 
     if [[ -f "$cert_pem" || -f "$cert_key" ]]; then
