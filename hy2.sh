@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 # V2bX Nginx masquerade installer (Hysteria2 + TLS)
 # Architecture:
-#   TCP: Nginx website on the chosen port or port range
-#   UDP: V2bX Hysteria2 node on the same numeric port or port range
+#   TCP: Nginx website only on 443 for masquerade
+#   UDP: V2bX Hysteria2 listens only on 443
+#   UDP: user-facing port range (default 10001-10099) is NAT redirected to local 443
 #
 # Purpose:
 # - Keep the usable grpc.sh interaction style
 # - Adapt the deployment to a V2board/V2bX Hysteria2 node
 # - Reuse the same domain/certificate for Nginx(TCP) and HY2(UDP)
+# - Keep random/multiple client ports by redirecting the UDP range to 443, similar to agsb's port-hopping idea
 
 set -u
 set -o pipefail
@@ -37,6 +39,9 @@ PORT_START=""
 PORT_END=""
 PRIMARY_PORT=""
 PORT_RANGE_LIMIT="1000"
+HY2_LISTEN_PORT="443"
+FORWARD_SCRIPT="/usr/local/sbin/v2hy2-port-forward.sh"
+FORWARD_SERVICE="v2hy2-port-forward.service"
 CERT_FILE=""
 KEY_FILE=""
 PROXY_URL=""
@@ -373,15 +378,10 @@ port_spec_to_iptables() {
 }
 
 build_nginx_https_listens() {
-    local p=""
-    local lines=""
-
-    for ((p=PORT_START; p<=PORT_END; p++)); do
-        lines+="    listen ${p} ssl http2;"$'\n'
-        lines+="    listen [::]:${p} ssl http2;"$'\n'
-    done
-
-    printf "%s" "$lines"
+    # Nginx only provides the camouflage website on TCP 443.
+    # The public HY2 port range is UDP-only and is redirected to local UDP 443.
+    printf "    listen ${HY2_LISTEN_PORT} ssl http2;\n"
+    printf "    listen [::]:${HY2_LISTEN_PORT} ssl http2;\n"
 }
 
 check_port_range_in_use_tcp() {
@@ -402,6 +402,80 @@ check_port_range_in_use_udp() {
     done
 
     return 0
+}
+
+setup_hy2_port_forward() {
+    local iptables_ports=""
+    iptables_ports="$(port_spec_to_iptables)"
+
+    command_exists iptables || {
+        warn "未检测到 iptables，无法自动配置 UDP ${PORT} → ${HY2_LISTEN_PORT} 转发"
+        warn "请手动配置等效 nftables/防火墙规则"
+        return 1
+    }
+
+    # UDP public range -> local HY2 UDP 443.
+    iptables -t nat -C PREROUTING -p udp --dport "$iptables_ports" -j REDIRECT --to-ports "$HY2_LISTEN_PORT" >/dev/null 2>&1 \
+        || iptables -t nat -A PREROUTING -p udp --dport "$iptables_ports" -j REDIRECT --to-ports "$HY2_LISTEN_PORT"
+
+    # Keep a local OUTPUT rule for loopback tests. It does not affect external clients.
+    iptables -t nat -C OUTPUT -p udp -d 127.0.0.1/32 --dport "$iptables_ports" -j REDIRECT --to-ports "$HY2_LISTEN_PORT" >/dev/null 2>&1 \
+        || iptables -t nat -A OUTPUT -p udp -d 127.0.0.1/32 --dport "$iptables_ports" -j REDIRECT --to-ports "$HY2_LISTEN_PORT" >/dev/null 2>&1 || true
+
+    success "已配置 UDP ${PORT} → 本机 ${HY2_LISTEN_PORT} 的端口转发"
+}
+
+create_hy2_forward_service() {
+    local iptables_ports=""
+    iptables_ports="$(port_spec_to_iptables)"
+
+    command_exists systemctl || return 0
+    command_exists iptables || return 0
+
+    cat > "$FORWARD_SCRIPT" <<EOF_FORWARD_SCRIPT
+#!/usr/bin/env bash
+set -e
+iptables -C INPUT -p tcp --dport ${HTTP_PORT} -j ACCEPT >/dev/null 2>&1 || iptables -I INPUT -p tcp --dport ${HTTP_PORT} -j ACCEPT
+iptables -C INPUT -p tcp --dport ${HY2_LISTEN_PORT} -j ACCEPT >/dev/null 2>&1 || iptables -I INPUT -p tcp --dport ${HY2_LISTEN_PORT} -j ACCEPT
+iptables -C INPUT -p udp --dport ${HY2_LISTEN_PORT} -j ACCEPT >/dev/null 2>&1 || iptables -I INPUT -p udp --dport ${HY2_LISTEN_PORT} -j ACCEPT
+iptables -C INPUT -p udp --dport ${iptables_ports} -j ACCEPT >/dev/null 2>&1 || iptables -I INPUT -p udp --dport ${iptables_ports} -j ACCEPT
+iptables -t nat -C PREROUTING -p udp --dport ${iptables_ports} -j REDIRECT --to-ports ${HY2_LISTEN_PORT} >/dev/null 2>&1 || iptables -t nat -A PREROUTING -p udp --dport ${iptables_ports} -j REDIRECT --to-ports ${HY2_LISTEN_PORT}
+iptables -t nat -C OUTPUT -p udp -d 127.0.0.1/32 --dport ${iptables_ports} -j REDIRECT --to-ports ${HY2_LISTEN_PORT} >/dev/null 2>&1 || iptables -t nat -A OUTPUT -p udp -d 127.0.0.1/32 --dport ${iptables_ports} -j REDIRECT --to-ports ${HY2_LISTEN_PORT} >/dev/null 2>&1 || true
+EOF_FORWARD_SCRIPT
+    chmod 755 "$FORWARD_SCRIPT"
+
+    cat > "/etc/systemd/system/${FORWARD_SERVICE}" <<EOF_FORWARD_SERVICE
+[Unit]
+Description=V2bX HY2 UDP port range redirect to 443
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${FORWARD_SCRIPT}
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF_FORWARD_SERVICE
+
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl enable --now "$FORWARD_SERVICE" >/dev/null 2>&1 || warn "端口转发 systemd 服务启用失败，请手动执行 ${FORWARD_SCRIPT}"
+}
+
+remove_hy2_forward_service() {
+    if command_exists systemctl; then
+        systemctl disable --now "$FORWARD_SERVICE" >/dev/null 2>&1 || true
+        rm -f "/etc/systemd/system/${FORWARD_SERVICE}"
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+    rm -f "$FORWARD_SCRIPT"
+}
+
+show_hy2_forward_rules() {
+    if command_exists iptables; then
+        iptables -t nat -S PREROUTING 2>/dev/null | grep -E -- "--dport (${PORT}|$(port_spec_to_iptables)) .*--to-ports ${HY2_LISTEN_PORT}" || true
+    fi
 }
 
 checkSystem() {
@@ -514,8 +588,8 @@ getData() {
     colorEcho "$YELLOW" "  1. 一个伪装域名 DNS 解析指向当前服务器 IP（${IP:-未检测到公网IP}）"
     colorEcho "$BLUE"   "  2. 可手动输入当前域名专属证书路径；如不输入，再尝试 /root/v2ray.pem 和 /root/v2ray.key"
     colorEcho "$BLUE"   "  3. 如果没有现成证书，脚本仍可使用 acme.sh 自动申请"
-    colorEcho "$BLUE"   "  4. V2board / V2bX 节点协议将改为 Hysteria2，监听 UDP 端口与本脚本中的用户连接端口保持一致"
-    colorEcho "$BLUE"   "  5. 最终结构为：TCP 同端口给 Nginx 网站，UDP 同端口给 V2bX 的 HY2 节点"
+    colorEcho "$BLUE"   "  4. V2board / V2bX 节点协议改为 Hysteria2，服务端只监听 UDP ${HY2_LISTEN_PORT}"
+    colorEcho "$BLUE"   "  5. 最终结构为：TCP ${HY2_LISTEN_PORT} 给 Nginx 网站；UDP ${PORT} 入口转发到 UDP ${HY2_LISTEN_PORT}"
     echo ""
     read -r -p " 确认满足按 y，按其他退出脚本：" answer
     [[ "${answer,,}" == "y" ]] || exit 0
@@ -563,10 +637,15 @@ getData() {
     read -r -p " 请输入用户连接端口[单端口或端口段，默认10001-10099]：" PORT
     [[ -z "$PORT" ]] && PORT="10001-10099"
     set_port_range "$PORT"
-    info "用户连接端口(TCP/UDP)：$PORT"
+    info "用户连接端口(UDP入口)：$PORT"
+    info "Nginx/HY2 实际监听端口：${HY2_LISTEN_PORT}（TCP 给 Nginx，UDP 给 HY2）"
 
     if port_spec_contains "$HTTP_PORT"; then
         die "HTTP 端口不能落在用户连接端口/端口段内"
+    fi
+
+    if port_spec_contains "$HY2_LISTEN_PORT"; then
+        die "用户连接端口段不能包含 ${HY2_LISTEN_PORT}，因为 ${HY2_LISTEN_PORT} 已作为 Nginx/HY2 后端监听端口"
     fi
 
     echo ""
@@ -778,9 +857,8 @@ configNginx() {
     local redirect_suffix=""
     local https_listens=""
 
-    if [[ "$PRIMARY_PORT" != "443" ]]; then
-        redirect_suffix=":${PRIMARY_PORT}"
-    fi
+    # HTTP always redirects to the camouflage HTTPS site on TCP 443.
+    redirect_suffix=""
 
     https_listens="$(build_nginx_https_listens)"
 
@@ -993,24 +1071,28 @@ setFirewall() {
 
     if command_exists firewall-cmd && systemctl is-active --quiet firewalld; then
         firewall-cmd --permanent --add-port="${HTTP_PORT}/tcp" >/dev/null 2>&1 || true
-        firewall-cmd --permanent --add-port="${PORT}/tcp" >/dev/null 2>&1 || true
+        firewall-cmd --permanent --add-port="${HY2_LISTEN_PORT}/tcp" >/dev/null 2>&1 || true
+        firewall-cmd --permanent --add-port="${HY2_LISTEN_PORT}/udp" >/dev/null 2>&1 || true
         firewall-cmd --permanent --add-port="${PORT}/udp" >/dev/null 2>&1 || true
         firewall-cmd --reload >/dev/null 2>&1 || true
-        return
     fi
 
     if command_exists ufw && ufw status 2>/dev/null | grep -vq inactive; then
         ufw allow "${HTTP_PORT}/tcp" >/dev/null 2>&1 || true
-        ufw allow "${ufw_ports}/tcp" >/dev/null 2>&1 || true
+        ufw allow "${HY2_LISTEN_PORT}/tcp" >/dev/null 2>&1 || true
+        ufw allow "${HY2_LISTEN_PORT}/udp" >/dev/null 2>&1 || true
         ufw allow "${ufw_ports}/udp" >/dev/null 2>&1 || true
-        return
     fi
 
     if command_exists iptables; then
         iptables -C INPUT -p tcp --dport "$HTTP_PORT" -j ACCEPT >/dev/null 2>&1 || iptables -I INPUT -p tcp --dport "$HTTP_PORT" -j ACCEPT
-        iptables -C INPUT -p tcp --dport "$iptables_ports" -j ACCEPT >/dev/null 2>&1 || iptables -I INPUT -p tcp --dport "$iptables_ports" -j ACCEPT
+        iptables -C INPUT -p tcp --dport "$HY2_LISTEN_PORT" -j ACCEPT >/dev/null 2>&1 || iptables -I INPUT -p tcp --dport "$HY2_LISTEN_PORT" -j ACCEPT
+        iptables -C INPUT -p udp --dport "$HY2_LISTEN_PORT" -j ACCEPT >/dev/null 2>&1 || iptables -I INPUT -p udp --dport "$HY2_LISTEN_PORT" -j ACCEPT
         iptables -C INPUT -p udp --dport "$iptables_ports" -j ACCEPT >/dev/null 2>&1 || iptables -I INPUT -p udp --dport "$iptables_ports" -j ACCEPT
     fi
+
+    setup_hy2_port_forward || true
+    create_hy2_forward_service || true
 }
 
 installBBR() {
@@ -1046,18 +1128,20 @@ installBBR() {
 
 showSummary() {
     echo ""
-    success "安装完成：同一端口/端口段的 TCP+UDP 分流已为 V2bX 的 Hysteria2 节点准备好"
+    success "安装完成：UDP 多入口端口已转发到 443，Nginx 仅在 443/TCP 提供伪装站"
     success "------------------- 端口结构 -------------------"
     colorEcho "$RED"   " 域名：${DOMAIN}"
     colorEcho "$RED"   " HTTP 端口(TCP)：${HTTP_PORT}"
-    colorEcho "$RED"   " HTTPS 伪装站端口(TCP)：${PORT}"
-    colorEcho "$RED"   " Hysteria2 节点端口(UDP)：${PORT}"
+    colorEcho "$RED"   " HTTPS 伪装站端口(TCP)：${HY2_LISTEN_PORT}"
+    colorEcho "$RED"   " Hysteria2 实际监听端口(UDP)：${HY2_LISTEN_PORT}"
+    colorEcho "$RED"   " 用户连接入口端口(UDP)：${PORT} → ${HY2_LISTEN_PORT}"
 
     echo ""
     success "---------- V2board / XBoard / V2bX 建议配置 ----------"
     colorEcho "$RED"   " 协议：hysteria2"
     colorEcho "$RED"   " 地址(address / server)：${DOMAIN}"
-    colorEcho "$RED"   " 端口(port)：${PORT}"
+    colorEcho "$RED"   " 面板/V2bX 节点监听端口(port)：${HY2_LISTEN_PORT}"
+    colorEcho "$RED"   " 客户端可用入口端口：${PORT}"
     colorEcho "$RED"   " SNI / server_name：${DOMAIN}"
     colorEcho "$RED"   " ALPN：h3"
     colorEcho "$RED"   " 传输层：udp / quic"
@@ -1067,15 +1151,17 @@ showSummary() {
 
     echo ""
     success "---------- 节点侧要点 ----------"
-    colorEcho "$RED"   " 1. 面板节点端口与 V2bX 节点监听端口都设为 ${PORT}"
-    colorEcho "$RED"   " 2. V2bX 的 Hysteria2 节点监听 UDP ${PORT}"
-    colorEcho "$RED"   " 3. Nginx 占用 TCP ${PORT} 提供网站伪装，TCP/UDP 同端口不会冲突"
-    colorEcho "$RED"   " 4. 若面板支持证书路径，请使用上面的 cert/key 路径"
+    colorEcho "$RED"   " 1. 面板/V2bX 的 Hysteria2 节点监听端口设为 ${HY2_LISTEN_PORT}"
+    colorEcho "$RED"   " 2. 客户端可以使用 ${PORT} 中任意 UDP 端口连接"
+    colorEcho "$RED"   " 3. iptables 会把 UDP ${PORT} 自动转发到本机 UDP ${HY2_LISTEN_PORT}"
+    colorEcho "$RED"   " 4. Nginx 只占用 TCP ${HY2_LISTEN_PORT} 提供网站伪装"
+    colorEcho "$RED"   " 5. 若面板支持证书路径，请使用上面的 cert/key 路径"
 
     echo ""
     info "Nginx 配置文件：${SITE_CONF}"
     info "证书文件：${CERT_FILE}"
-    info "请把面板 / V2bX 节点协议改为 Hysteria2，并确认其监听 UDP ${PORT}。"
+    info "请把面板 / V2bX 节点协议改为 Hysteria2，并确认其监听 UDP ${HY2_LISTEN_PORT}。"
+    info "客户端/订阅显示端口可以使用 ${PORT}；服务端会自动转发到 ${HY2_LISTEN_PORT}。"
 }
 
 bbrReboot() {
@@ -1102,17 +1188,23 @@ postCheck() {
         ok="false"
     fi
 
-    if check_port_range_in_use_tcp; then
-        success "检测到 TCP ${PORT} 已在监听（Nginx）"
+    if is_port_in_use_tcp "$HY2_LISTEN_PORT"; then
+        success "检测到 TCP ${HY2_LISTEN_PORT} 已在监听（Nginx）"
     else
-        warn "未检测到完整 TCP ${PORT} 监听"
+        warn "未检测到 TCP ${HY2_LISTEN_PORT} 监听"
         ok="false"
     fi
 
-    if check_port_range_in_use_udp; then
-        success "检测到 UDP ${PORT} 已在监听（V2bX/HY2）"
+    if is_port_in_use_udp "$HY2_LISTEN_PORT"; then
+        success "检测到 UDP ${HY2_LISTEN_PORT} 已在监听（V2bX/HY2）"
     else
-        warn "尚未检测到完整 UDP ${PORT} 监听，这通常表示面板/V2bX 节点端口还没改成 ${PORT}，或 V2bX 尚未加载 Hysteria2 节点"
+        warn "尚未检测到 UDP ${HY2_LISTEN_PORT} 监听，请确认 V2bX 的 Hysteria2 节点端口已改为 ${HY2_LISTEN_PORT}"
+    fi
+
+    if command_exists iptables && iptables -t nat -C PREROUTING -p udp --dport "$(port_spec_to_iptables)" -j REDIRECT --to-ports "$HY2_LISTEN_PORT" >/dev/null 2>&1; then
+        success "检测到 UDP ${PORT} → ${HY2_LISTEN_PORT} 的转发规则"
+    else
+        warn "未检测到 UDP ${PORT} → ${HY2_LISTEN_PORT} 的转发规则"
     fi
 
     [[ "$ok" == "true" ]]
@@ -1253,6 +1345,13 @@ uninstall_proxy() {
         fi
     fi
 
+    echo ""
+    read -r -p "是否一并删除 HY2 UDP 端口转发服务？[y/N]：" answer
+    if [[ "${answer,,}" == "y" ]]; then
+        remove_hy2_forward_service
+        success "已删除 HY2 UDP 端口转发服务"
+    fi
+
     success "已删除站点配置：$conf"
     info "此脚本不会删除 V2bX 节点，请再去面板中手动调整或删除对应的 Hysteria2 节点。"
 }
@@ -1270,6 +1369,10 @@ show_status() {
     else
         warn "Nginx: 未运行"
     fi
+
+    echo ""
+    info "HY2 端口结构：UDP ${PORT} → ${HY2_LISTEN_PORT}，Nginx TCP ${HY2_LISTEN_PORT}"
+    show_hy2_forward_rules
 }
 
 menu() {
