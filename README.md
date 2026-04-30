@@ -29,6 +29,14 @@ Nginx 伪装网站
 
 ## 一键安装
 
+远程一键安装命令保持为：
+
+```shell
+bash <(curl -fsSL https://raw.githubusercontent.com/limo13660/v2bx-proxy/main/install.sh)
+```
+
+如果是下载 zip 后本地安装，则执行：
+
 ```shell
 bash install.sh
 ```
