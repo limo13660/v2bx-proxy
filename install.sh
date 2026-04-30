@@ -173,6 +173,7 @@ main() {
     success "安装完成，可直接运行：${SHORTCUT_CMD}"
     success "HY2 伪装脚本：${HY2_SHORTCUT_CMD}"
     info "更新通用反代脚本命令：${SHORTCUT_CMD} update"
+    info "更新 HY2 伪装脚本命令：${HY2_SHORTCUT_CMD} update"
     info "远程一键安装命令：${ONE_KEY_INSTALL_CMD}"
     info "项目地址：${PROJECT_REPO_URL}"
 }

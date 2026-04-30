@@ -52,6 +52,10 @@ INSTALL_BBR="false"
 SITE_CONF=""
 ROBOT_CONFIG=""
 DEFAULT_PROXY_URL="https://bing.ioliu.cn"
+SHORTCUT_CMD="v2hy2"
+SHORTCUT_PATH="/usr/local/bin/${SHORTCUT_CMD}"
+PROJECT_REPO_URL="https://github.com/limo13660/v2bx-proxy"
+ONE_KEY_INSTALL_CMD="bash <(curl -fsSL https://raw.githubusercontent.com/limo13660/v2bx-proxy/main/install.sh)"
 
 colorEcho() {
     echo -e "${1}${@:2}${PLAIN}"
@@ -99,6 +103,83 @@ safe_wget() {
 
     rm -f "$out"
     return 1
+}
+
+validate_script_file() {
+    local file="$1"
+
+    [[ -s "$file" ]] || return 1
+    grep -q '^#!/usr/bin/env bash' "$file" 2>/dev/null || return 1
+    bash -n "$file" >/dev/null 2>&1 || return 1
+}
+
+download_latest_script_to_file() {
+    local outfile="$1"
+    local url=""
+    local -a update_urls=(
+        "https://raw.githubusercontent.com/limo13660/v2bx-proxy/main/hy2.sh"
+        "https://raw.githubusercontent.com/limo13660/v2bx-proxy/master/hy2.sh"
+    )
+
+    rm -f "$outfile"
+
+    for url in "${update_urls[@]}"; do
+        info "尝试下载 HY2 脚本：$url"
+        if ! safe_wget "$url" "$outfile"; then
+            warn "下载失败：$url"
+            continue
+        fi
+
+        if validate_script_file "$outfile"; then
+            return 0
+        fi
+
+        warn "下载内容不是有效 HY2 脚本：$url"
+        rm -f "$outfile"
+    done
+
+    return 1
+}
+
+install_shortcut_from_file() {
+    local source_file="$1"
+    local target_path="${2:-$SHORTCUT_PATH}"
+    local tmp_target="${target_path}.tmp.$$"
+
+    [[ -r "$source_file" ]] || return 1
+    mkdir -p "$(dirname "$target_path")" || return 1
+
+    cat "$source_file" > "$tmp_target" || {
+        rm -f "$tmp_target"
+        return 1
+    }
+    chmod 755 "$tmp_target" || {
+        rm -f "$tmp_target"
+        return 1
+    }
+    mv -f "$tmp_target" "$target_path" || {
+        rm -f "$tmp_target"
+        return 1
+    }
+}
+
+update_script() {
+    echo ""
+    info "开始更新 HY2 伪装脚本..."
+
+    local tmpfile="/tmp/${SHORTCUT_CMD}.update.$$"
+    download_latest_script_to_file "$tmpfile" || die "HY2 脚本更新失败：无法从项目地址下载有效更新，请检查网络或仓库地址"
+
+    install_shortcut_from_file "$tmpfile" "$SHORTCUT_PATH" || {
+        rm -f "$tmpfile"
+        die "更新失败：无法写入 ${SHORTCUT_PATH}"
+    }
+
+    rm -f "$tmpfile"
+    success "HY2 脚本更新完成，可直接运行：${SHORTCUT_CMD}"
+    info "远程一键安装命令：${ONE_KEY_INSTALL_CMD}"
+    info "项目地址：${PROJECT_REPO_URL}"
+    return 0
 }
 
 write_robots_file() {
@@ -1384,6 +1465,7 @@ menu() {
     echo -e "  ${GREEN}1.${PLAIN}   为 V2bX 添加 Hysteria2 的 Nginx 伪装"
     echo -e "  ${GREEN}2.${PLAIN}   检测并删除某个域名的伪装站配置"
     echo -e "  ${GREEN}3.${PLAIN}   查看当前服务状态"
+    echo -e "  ${GREEN}4.${PLAIN}   更新 HY2 脚本"
     echo -e "  ${GREEN}0.${PLAIN}   退出"
     echo ""
 
@@ -1392,6 +1474,7 @@ menu() {
         1) install_proxy ;;
         2) uninstall_proxy ;;
         3) show_status ;;
+        4) update_script ;;
         0) exit 0 ;;
         *) die "请选择正确的操作！" ;;
     esac
@@ -1413,7 +1496,12 @@ case "$action" in
     status)
         show_status
         ;;
+    update)
+        update_script
+        ;;
     *)
-        die "不支持的参数：$action"
+        echo "参数错误"
+        echo "用法: $(basename "$0") [menu|install|uninstall|status|update]"
+        exit 1
         ;;
 esac

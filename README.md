@@ -59,6 +59,27 @@ HY2 默认用户连接入口端口段为：
 10001-10099
 ```
 
+
+## 更新脚本
+
+更新通用反代脚本：
+
+```shell
+v2pr update
+```
+
+更新 HY2 伪装脚本：
+
+```shell
+v2hy2 update
+```
+
+也可以重新执行一键安装命令覆盖安装：
+
+```shell
+bash <(curl -fsSL https://raw.githubusercontent.com/limo13660/v2bx-proxy/main/install.sh)
+```
+
 ## 面板 / V2bX 配置重点
 
 V2bX / 面板中的 Hysteria2 节点实际监听端口请设为：
