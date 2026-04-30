@@ -41,6 +41,8 @@ ROBOT_CONFIG=""
 DEFAULT_PROXY_URL="https://bing.ioliu.cn"
 SHORTCUT_CMD="v2pr"
 SHORTCUT_PATH="/usr/local/bin/${SHORTCUT_CMD}"
+HY2_SHORTCUT_CMD="v2hy2"
+HY2_SCRIPT_NAME="hy2.sh"
 PROJECT_REPO_URL="https://github.com/limo13660/v2bx-proxy"
 
 colorEcho() {
@@ -185,6 +187,31 @@ update_script() {
     success "脚本更新完成，可直接运行：${SHORTCUT_CMD}"
     info "项目地址：${PROJECT_REPO_URL}"
     return 0
+}
+
+run_hy2_proxy() {
+    local script_source="${BASH_SOURCE[0]:-$0}"
+    local script_dir=""
+
+    if command_exists "$HY2_SHORTCUT_CMD"; then
+        "$HY2_SHORTCUT_CMD"
+        return $?
+    fi
+
+    case "$script_source" in
+        /dev/fd/*|/proc/*|"")
+            ;;
+        *)
+            script_dir="$(cd "$(dirname "$script_source")" && pwd)"
+            if [[ -f "${script_dir}/${HY2_SCRIPT_NAME}" ]]; then
+                bash "${script_dir}/${HY2_SCRIPT_NAME}"
+                return $?
+            fi
+            ;;
+    esac
+
+    warn "未找到 HY2 伪装脚本。请先运行 install.sh 安装 v2hy2，或直接执行 hy2.sh。"
+    return 1
 }
 
 fetch_public_ip() {
@@ -1240,6 +1267,7 @@ menu() {
     echo -e "  ${GREEN}2.${PLAIN}   检测并删除某个域名的反代配置"
     echo -e "  ${GREEN}3.${PLAIN}   查看当前 Nginx 状态"
     echo -e "  ${GREEN}4.${PLAIN}   更新脚本"
+    echo -e "  ${GREEN}5.${PLAIN}   添加 V2bX HY2 Nginx 伪装"
     echo -e "  ${GREEN}0.${PLAIN}   退出"
     echo ""
 
@@ -1249,6 +1277,7 @@ menu() {
         2) uninstall_proxy ;;
         3) show_status ;;
         4) update_script ;;
+        5) run_hy2_proxy ;;
         0) exit 0 ;;
         *) die "请选择正确的操作！" ;;
     esac
@@ -1274,9 +1303,12 @@ case "$action" in
     update)
         update_script
         ;;
+    hy2)
+        run_hy2_proxy
+        ;;
     *)
         echo "参数错误"
-        echo "用法: $(basename "$0") [menu|install|uninstall_proxy|status|update]"
+        echo "用法: $(basename "$0") [menu|install|uninstall_proxy|status|update|hy2]"
         exit 1
         ;;
 esac

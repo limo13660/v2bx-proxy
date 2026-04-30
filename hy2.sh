@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # V2bX Nginx masquerade installer (Hysteria2 + TLS)
 # Architecture:
-#   TCP: Nginx website on the chosen port
-#   UDP: V2bX Hysteria2 node on the same numeric port
+#   TCP: Nginx website on the chosen port or port range
+#   UDP: V2bX Hysteria2 node on the same numeric port or port range
 #
 # Purpose:
 # - Keep the usable grpc.sh interaction style
@@ -32,7 +32,11 @@ IPV6=""
 IP=""
 DOMAIN=""
 HTTP_PORT="80"
-PORT="443"
+PORT="10001-10099"
+PORT_START=""
+PORT_END=""
+PRIMARY_PORT=""
+PORT_RANGE_LIMIT="1000"
 CERT_FILE=""
 KEY_FILE=""
 PROXY_URL=""
@@ -314,6 +318,92 @@ is_port_in_use_udp() {
     return 1
 }
 
+set_port_range() {
+    local spec="$1"
+    local start=""
+    local end=""
+    local count=""
+
+    spec="${spec//[[:space:]]/}"
+
+    if [[ "$spec" =~ ^([1-9][0-9]{0,4})$ ]]; then
+        start="${BASH_REMATCH[1]}"
+        end="$start"
+    elif [[ "$spec" =~ ^([1-9][0-9]{0,4})-([1-9][0-9]{0,4})$ ]]; then
+        start="${BASH_REMATCH[1]}"
+        end="${BASH_REMATCH[2]}"
+    else
+        die "连接端口格式错误，请输入单端口或端口段，例如 443 或 10001-10099"
+    fi
+
+    (( start >= 100 && start <= 65535 )) || die "连接端口起始值范围错误"
+    (( end >= 100 && end <= 65535 )) || die "连接端口结束值范围错误"
+    (( start <= end )) || die "连接端口段起始值不能大于结束值"
+
+    count=$((end - start + 1))
+    (( count <= PORT_RANGE_LIMIT )) || die "连接端口段最多支持 ${PORT_RANGE_LIMIT} 个端口，避免 Nginx 配置过大"
+
+    PORT_START="$start"
+    PORT_END="$end"
+    PRIMARY_PORT="$start"
+
+    if [[ "$start" == "$end" ]]; then
+        PORT="$start"
+    else
+        PORT="${start}-${end}"
+    fi
+}
+
+port_spec_contains() {
+    local port="$1"
+    [[ "$port" =~ ^[0-9]+$ ]] || return 1
+    (( port >= PORT_START && port <= PORT_END ))
+}
+
+port_spec_to_ufw() {
+    if [[ "$PORT_START" == "$PORT_END" ]]; then
+        echo "$PORT_START"
+    else
+        echo "${PORT_START}:${PORT_END}"
+    fi
+}
+
+port_spec_to_iptables() {
+    port_spec_to_ufw
+}
+
+build_nginx_https_listens() {
+    local p=""
+    local lines=""
+
+    for ((p=PORT_START; p<=PORT_END; p++)); do
+        lines+="    listen ${p} ssl http2;"$'\n'
+        lines+="    listen [::]:${p} ssl http2;"$'\n'
+    done
+
+    printf "%s" "$lines"
+}
+
+check_port_range_in_use_tcp() {
+    local p=""
+
+    for ((p=PORT_START; p<=PORT_END; p++)); do
+        is_port_in_use_tcp "$p" || return 1
+    done
+
+    return 0
+}
+
+check_port_range_in_use_udp() {
+    local p=""
+
+    for ((p=PORT_START; p<=PORT_END; p++)); do
+        is_port_in_use_udp "$p" || return 1
+    done
+
+    return 0
+}
+
 checkSystem() {
     [[ $EUID -eq 0 ]] || die "请以 root 身份执行该脚本"
 
@@ -470,15 +560,13 @@ getData() {
     info "HTTP 端口：$HTTP_PORT"
 
     echo ""
-    read -r -p " 请输入用户连接端口[100-65535，默认443]：" PORT
-    [[ -z "$PORT" ]] && PORT=443
-    [[ "$PORT" =~ ^[0-9]+$ ]] || die "连接端口必须是数字"
-    (( PORT >= 100 && PORT <= 65535 )) || die "连接端口范围错误"
-    [[ "${PORT:0:1}" != "0" ]] || die "端口不能以 0 开头"
+    read -r -p " 请输入用户连接端口[单端口或端口段，默认10001-10099]：" PORT
+    [[ -z "$PORT" ]] && PORT="10001-10099"
+    set_port_range "$PORT"
     info "用户连接端口(TCP/UDP)：$PORT"
 
-    if [[ "$HTTP_PORT" == "$PORT" ]]; then
-        die "HTTP 端口与用户连接端口不能相同"
+    if port_spec_contains "$HTTP_PORT"; then
+        die "HTTP 端口不能落在用户连接端口/端口段内"
     fi
 
     echo ""
@@ -688,10 +776,13 @@ configNginx() {
     local bak_conf="${SITE_CONF}.bak"
     local site_action=""
     local redirect_suffix=""
+    local https_listens=""
 
-    if [[ "$PORT" != "443" ]]; then
-        redirect_suffix=":${PORT}"
+    if [[ "$PRIMARY_PORT" != "443" ]]; then
+        redirect_suffix=":${PRIMARY_PORT}"
     fi
+
+    https_listens="$(build_nginx_https_listens)"
 
     if [[ -n "$PROXY_URL" ]]; then
         site_action="proxy_ssl_server_name on;
@@ -715,8 +806,7 @@ server {
 }
 
 server {
-    listen ${PORT} ssl http2;
-    listen [::]:${PORT} ssl http2;
+${https_listens}
     server_name ${DOMAIN};
     charset utf-8;
 
@@ -895,6 +985,12 @@ installTemplate() {
 }
 
 setFirewall() {
+    local ufw_ports=""
+    local iptables_ports=""
+
+    ufw_ports="$(port_spec_to_ufw)"
+    iptables_ports="$(port_spec_to_iptables)"
+
     if command_exists firewall-cmd && systemctl is-active --quiet firewalld; then
         firewall-cmd --permanent --add-port="${HTTP_PORT}/tcp" >/dev/null 2>&1 || true
         firewall-cmd --permanent --add-port="${PORT}/tcp" >/dev/null 2>&1 || true
@@ -905,15 +1001,15 @@ setFirewall() {
 
     if command_exists ufw && ufw status 2>/dev/null | grep -vq inactive; then
         ufw allow "${HTTP_PORT}/tcp" >/dev/null 2>&1 || true
-        ufw allow "${PORT}/tcp" >/dev/null 2>&1 || true
-        ufw allow "${PORT}/udp" >/dev/null 2>&1 || true
+        ufw allow "${ufw_ports}/tcp" >/dev/null 2>&1 || true
+        ufw allow "${ufw_ports}/udp" >/dev/null 2>&1 || true
         return
     fi
 
     if command_exists iptables; then
         iptables -C INPUT -p tcp --dport "$HTTP_PORT" -j ACCEPT >/dev/null 2>&1 || iptables -I INPUT -p tcp --dport "$HTTP_PORT" -j ACCEPT
-        iptables -C INPUT -p tcp --dport "$PORT" -j ACCEPT >/dev/null 2>&1 || iptables -I INPUT -p tcp --dport "$PORT" -j ACCEPT
-        iptables -C INPUT -p udp --dport "$PORT" -j ACCEPT >/dev/null 2>&1 || iptables -I INPUT -p udp --dport "$PORT" -j ACCEPT
+        iptables -C INPUT -p tcp --dport "$iptables_ports" -j ACCEPT >/dev/null 2>&1 || iptables -I INPUT -p tcp --dport "$iptables_ports" -j ACCEPT
+        iptables -C INPUT -p udp --dport "$iptables_ports" -j ACCEPT >/dev/null 2>&1 || iptables -I INPUT -p udp --dport "$iptables_ports" -j ACCEPT
     fi
 }
 
@@ -950,7 +1046,7 @@ installBBR() {
 
 showSummary() {
     echo ""
-    success "安装完成：同一数字端口的 TCP+UDP 分流已为 V2bX 的 Hysteria2 节点准备好"
+    success "安装完成：同一端口/端口段的 TCP+UDP 分流已为 V2bX 的 Hysteria2 节点准备好"
     success "------------------- 端口结构 -------------------"
     colorEcho "$RED"   " 域名：${DOMAIN}"
     colorEcho "$RED"   " HTTP 端口(TCP)：${HTTP_PORT}"
@@ -972,7 +1068,7 @@ showSummary() {
     echo ""
     success "---------- 节点侧要点 ----------"
     colorEcho "$RED"   " 1. 面板节点端口与 V2bX 节点监听端口都设为 ${PORT}"
-    colorEcho "$RED"   " 2. V2bX 的 Hysteria2 节点只监听 UDP ${PORT}"
+    colorEcho "$RED"   " 2. V2bX 的 Hysteria2 节点监听 UDP ${PORT}"
     colorEcho "$RED"   " 3. Nginx 占用 TCP ${PORT} 提供网站伪装，TCP/UDP 同端口不会冲突"
     colorEcho "$RED"   " 4. 若面板支持证书路径，请使用上面的 cert/key 路径"
 
@@ -1006,17 +1102,17 @@ postCheck() {
         ok="false"
     fi
 
-    if is_port_in_use_tcp "$PORT"; then
+    if check_port_range_in_use_tcp; then
         success "检测到 TCP ${PORT} 已在监听（Nginx）"
     else
-        warn "未检测到 TCP ${PORT} 监听"
+        warn "未检测到完整 TCP ${PORT} 监听"
         ok="false"
     fi
 
-    if is_port_in_use_udp "$PORT"; then
+    if check_port_range_in_use_udp; then
         success "检测到 UDP ${PORT} 已在监听（V2bX/HY2）"
     else
-        warn "尚未检测到 UDP ${PORT} 监听，这通常表示面板/V2bX 节点端口还没改成 ${PORT}，或 V2bX 尚未加载 Hysteria2 节点"
+        warn "尚未检测到完整 UDP ${PORT} 监听，这通常表示面板/V2bX 节点端口还没改成 ${PORT}，或 V2bX 尚未加载 Hysteria2 节点"
     fi
 
     [[ "$ok" == "true" ]]
